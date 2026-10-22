@@ -5,76 +5,7 @@ open System
 open Feliz
 open Shared
 open State
-
-let private initials (name: string) =
-    name.Split([| ' ' |], StringSplitOptions.RemoveEmptyEntries)
-    |> Array.truncate 2
-    |> Array.map (fun part -> string (Char.ToUpper part[0]))
-    |> String.concat ""
-
-let private avatar (size: string) (user: User) =
-    Html.div [
-        prop.className ("avatar avatar-" + size)
-        prop.style [ style.backgroundColor user.AvatarColor ]
-        prop.title user.DisplayName
-        prop.text (initials user.DisplayName)
-    ]
-
-let private months =
-    [| "Jan"; "Feb"; "Mar"; "Apr"; "May"; "Jun"; "Jul"; "Aug"; "Sep"; "Oct"; "Nov"; "Dec" |]
-
-// Formatted by hand: Fable supports only a subset of .NET date format strings.
-let private formatDate (time: DateTime) =
-    let t = time.ToLocalTime()
-    sprintf "%s %d, %d" months[t.Month - 1] t.Day t.Year
-
-let private formatDateTime (time: DateTime) =
-    let t = time.ToLocalTime()
-    sprintf "%s %02d:%02d" (formatDate time) t.Hour t.Minute
-
-let private timeAgo (time: DateTime) =
-    let elapsed = DateTime.UtcNow - time.ToUniversalTime()
-
-    if elapsed.TotalMinutes < 1.0 then "just now"
-    elif elapsed.TotalHours < 1.0 then sprintf "%dm" (int elapsed.TotalMinutes)
-    elif elapsed.TotalDays < 1.0 then sprintf "%dh" (int elapsed.TotalHours)
-    elif elapsed.TotalDays < 7.0 then sprintf "%dd" (int elapsed.TotalDays)
-    else formatDate time
-
-let private onEnter (action: unit -> unit) =
-    prop.onKeyDown (fun (e: Browser.Types.KeyboardEvent) ->
-        if e.key = "Enter" && not e.shiftKey then
-            e.preventDefault ()
-            action ())
-
-let private button (className: string) (label: string) (onClick: unit -> unit) =
-    Html.button [
-        prop.type'.button
-        prop.className className
-        prop.text label
-        prop.onClick (fun _ -> onClick ())
-    ]
-
-let private field (label: string) (input: ReactElement) =
-    Html.label [ prop.className "field"; prop.children [ Html.span label; input ] ]
-
-let private textInput (value: string) (placeholder: string) (onChange: string -> unit) =
-    Html.input [
-        prop.className "input"
-        prop.value value
-        prop.placeholder placeholder
-        prop.onChange onChange
-    ]
-
-let private userLink (user: User) dispatch =
-    Html.a [
-        prop.className "user-link"
-        prop.href "#"
-        prop.text user.DisplayName
-        prop.onClick (fun e ->
-            e.preventDefault ()
-            dispatch (Navigate(Profile user)))
-    ]
+open Components
 
 // ---- Sign in / register -----------------------------------------------------
 
@@ -226,7 +157,9 @@ let private postCard (m: AppModel) (post: Post) dispatch =
                         ]
                 ]
             ]
-            Html.p [ prop.className "post-body"; prop.text post.Body ]
+            match post.Workflow with
+            | Some card -> WorkflowView.postCard card dispatch
+            | None -> Html.p [ prop.className "post-body"; prop.text post.Body ]
             Html.div [
                 prop.className "post-stats muted small"
                 prop.children [
@@ -326,9 +259,18 @@ let private feedPage (m: AppModel) feed dispatch =
                                 prop.text (sprintf "%d member%s" g.MemberCount (if g.MemberCount = 1 then "" else "s"))
                             ]
                         ]
-                        membershipButton g dispatch
+                        Html.div [
+                            prop.className "row banner-actions"
+                            prop.children [
+                                if g.IsMember then
+                                    button "btn" "⚡ Add workflow" (fun () -> dispatch NewWorkflow)
+                                membershipButton g dispatch
+                            ]
+                        ]
                     ]
                 ]
+
+                WorkflowView.groupWorkflows m g.Id dispatch
 
                 if g.IsMember then
                     composer m (sprintf "Post in %s…" g.Name) dispatch
@@ -569,7 +511,7 @@ let private navItem (icon: string) (label: string) (page: Page) (isActive: bool)
             Html.span [ prop.className "nav-icon"; prop.text icon ]
             Html.span label
             if badge > 0 then
-                Html.span [ prop.className "badge"; prop.title "Unread chats"; prop.text (string badge) ]
+                Html.span [ prop.className "badge"; prop.text (string badge) ]
         ]
     ]
 
@@ -610,6 +552,17 @@ let private appView (m: AppModel) dispatch =
                             navItem "👥" "Groups" Groups (m.Page = Groups) 0 dispatch
                             navItem "💬" "Chat" (Chat None) (match m.Page with Chat _ -> true | _ -> false) m.Unread.Count dispatch
                             navItem "📇" "People" People (m.Page = People) 0 dispatch
+                            navItem
+                                "⚡"
+                                "Workflows"
+                                (WorkflowsPage AllWorkflows)
+                                (match m.Page with
+                                 | WorkflowsPage _
+                                 | WorkflowEditor
+                                 | WorkflowResultsPage _ -> true
+                                 | _ -> false)
+                                m.Tasks.Length
+                                dispatch
                             Html.h4 [ prop.className "sidebar-heading"; prop.text "Your groups" ]
                             for g in m.Groups |> List.filter (fun g -> g.IsMember) do
                                 Html.button [
@@ -645,6 +598,9 @@ let private appView (m: AppModel) dispatch =
                             | People -> peoplePage m dispatch
                             | Chat partner -> chatPage m partner dispatch
                             | Profile user -> profilePage m user dispatch
+                            | WorkflowsPage tab -> WorkflowView.workflowsPage m tab dispatch
+                            | WorkflowEditor -> WorkflowView.editorPage m dispatch
+                            | WorkflowResultsPage id -> WorkflowView.resultsPage m id dispatch
                         ]
                     ]
                 ]

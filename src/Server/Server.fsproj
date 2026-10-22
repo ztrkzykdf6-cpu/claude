@@ -7,8 +7,11 @@
   <ItemGroup>
     <Compile Include="Db.fs" />
     <Compile Include="Auth.fs" />
+    <Compile Include="WorkflowDb.fs" />
     <Compile Include="Realtime.fs" />
+    <Compile Include="WorkflowEngine.fs" />
     <Compile Include="Api.fs" />
+    <Compile Include="WorkflowApi.fs" />
     <Compile Include="Seed.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

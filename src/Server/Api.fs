@@ -51,10 +51,22 @@ let auth (db: Store) : IAuthApi =
             } }
 
 /// The API as seen by one signed-in user; built per request from the authenticated session.
+/// How the feed API works with workflows, which are compiled after it.
+type WorkflowHooks =
+    { /// Lets workflows react to a new post.
+      OnPostCreated: Post -> Async<unit>
+      /// Adds workflow cards to posts that are a workflow's home in its group.
+      Decorate: User -> Post list -> Post list
+      IsWorkflowPost: int -> bool
+      /// The Workflow Bot account, which can't be messaged.
+      BotId: int }
+
 /// `notify` pushes a newly sent chat message to the participants' live connections.
-let workplace (db: Store) (notify: ChatMessage -> Async<unit>) (me: User) (token: string) : IWorkplaceApi =
+let workplace (db: Store) (notify: ChatMessage -> Async<unit>) (hooks: WorkflowHooks) (me: User) (token: string) : IWorkplaceApi =
+    let decorate = hooks.Decorate me
+
     let post postId =
-        match db.GetPost(me.Id, postId) with
+        match db.GetPost(me.Id, postId) |> Option.map (List.singleton >> decorate >> List.head) with
         | Some p -> p
         | None -> raise (NotFound "That post no longer exists")
 
@@ -67,22 +79,24 @@ let workplace (db: Store) (notify: ChatMessage -> Async<unit>) (me: User) (token
 
       logout = fun () -> async { db.DeleteSession(Auth.hashToken token) }
 
-      getFeed = fun feed -> async { return db.GetFeed(me.Id, feed) }
+      getFeed = fun feed -> async { return db.GetFeed(me.Id, feed) |> decorate }
 
       createPost =
         fun np ->
             async {
                 let body = np.Body.Trim()
 
-                return
-                    if body = "" then
-                        Error "Write something before posting"
-                    elif body.Length > Validation.maxPostLength then
-                        Error $"Posts are limited to {Validation.maxPostLength} characters"
-                    else
-                        match np.GroupId with
-                        | Some g when not (db.IsMember(me.Id, g)) -> Error "Join the group to post in it"
-                        | groupId -> Ok(post (db.CreatePost(me.Id, groupId, body)))
+                if body = "" then
+                    return Error "Write something before posting"
+                elif body.Length > Validation.maxPostLength then
+                    return Error $"Posts are limited to {Validation.maxPostLength} characters"
+                else
+                    match np.GroupId with
+                    | Some g when not (db.IsMember(me.Id, g)) -> return Error "Join the group to post in it"
+                    | groupId ->
+                        let created = post (db.CreatePost(me.Id, groupId, body))
+                        do! hooks.OnPostCreated created
+                        return Ok created
             }
 
       deletePost =
@@ -92,6 +106,7 @@ let workplace (db: Store) (notify: ChatMessage -> Async<unit>) (me: User) (token
                     match db.PostAuthor postId with
                     | None -> Error "That post no longer exists"
                     | Some author when author <> me.Id -> Error "You can only delete your own posts"
+                    | Some _ when hooks.IsWorkflowPost postId -> Error "This post belongs to a workflow. Delete the workflow instead."
                     | Some _ -> Ok(db.DeletePost postId)
             }
 
@@ -168,6 +183,8 @@ let workplace (db: Store) (notify: ChatMessage -> Async<unit>) (me: User) (token
                     return Error $"Messages are limited to {Validation.maxMessageLength} characters"
                 elif recipientId = me.Id then
                     return Error "You can't message yourself"
+                elif recipientId = hooks.BotId then
+                    return Error "Workflow Bot only sends messages and can't read replies"
                 elif (db.GetUser recipientId).IsNone then
                     return Error "That person no longer exists"
                 else

@@ -2,6 +2,7 @@
 module Seed
 
 open Shared
+open Workflows
 open Db
 
 let demoPassword = "password123"
@@ -13,7 +14,7 @@ let private people: RegisterRequest list =
       { Username = "mei"; Password = demoPassword; DisplayName = "Mei Chen"; Title = "People Partner"; Department = "HR" }
       { Username = "jordan"; Password = demoPassword; DisplayName = "Jordan Blake"; Title = "Sales Lead"; Department = "Sales" } ]
 
-let run (db: Store) =
+let run (db: Store) (workflows: WorkflowDb.WorkflowStore) =
     if db.UserCount() = 0 then
         let hash = Auth.hashPassword demoPassword
         let users = people |> List.map (fun p -> db.CreateUser(p, hash) |> Result.toOption |> Option.get)
@@ -56,3 +57,58 @@ let run (db: Store) =
 
         db.SendMessage(id "alex", id "sam", "Can you look at the deploy checklist before tomorrow?") |> ignore
         db.SendMessage(id "sam", id "alex", "On it, I'll send comments by noon.") |> ignore
+
+        let workflow owner group name description instructions visibility trigger steps =
+            workflows.Save(
+                id owner,
+                { Id = 0
+                  GroupId = group
+                  Name = name
+                  Description = description
+                  Instructions = instructions
+                  ResultsVisibility = visibility
+                  Trigger = trigger
+                  Steps = steps }
+            )
+            |> ignore
+
+        workflow
+            "mei"
+            everyone
+            "Request time off"
+            "Ask for time off; your manager approves it."
+            "Request at least two weeks ahead for vacations. For sick leave, request on the day."
+            OwnerOnly
+            Manual
+            [ CollectInput(
+                  TriggeringUser,
+                  "Time off request",
+                  [ { Label = "Dates"; Kind = ShortText; Required = true }
+                    { Label = "Type"; Kind = Dropdown "Vacation, Sick leave, Personal"; Required = true }
+                    { Label = "Notes"; Kind = LongText; Required = false } ]
+              )
+              RequestApproval(
+                  SpecificUser(id "alex"),
+                  "{{trigger.user}} is asking for time off ({{form.type}}): {{form.dates}}\n{{form.notes}}"
+              )
+              SendMessage(TriggeringUser, "Your time off for {{form.dates}} was approved by {{approval.by}}. Enjoy!") ]
+
+        workflow
+            "alex"
+            eng
+            "Incident alert"
+            "Messages the engineering manager when an Engineering post mentions an incident."
+            "Mention \"incident\" in your post and include what's affected."
+            GroupMembers
+            (NewGroupPost(eng, "incident"))
+            [ SendMessage(SpecificUser(id "alex"), "{{trigger.user}} posted about an incident in {{trigger.group}}:\n{{trigger.post}}") ]
+
+        workflow
+            "mei"
+            everyone
+            "Monday kickoff"
+            "Posts a weekly prompt in Company Announcements."
+            ""
+            GroupMembers
+            (Scheduled { Days = [ 1 ]; Hour = 9; Minute = 0; TimeZone = "UTC" })
+            [ PostToGroup(everyone, "Happy Monday! What's your top priority this week? Share it in the comments.") ]

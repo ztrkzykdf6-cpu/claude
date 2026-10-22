@@ -70,13 +70,16 @@ let private schema =
 let private avatarPalette =
     [| "#1877f2"; "#42b72a"; "#f02849"; "#8a3ffc"; "#f7b928"; "#0f9d8a"; "#e4712b"; "#5b6b8c" |]
 
+/// The account workflow messages and posts come from. The hyphen keeps it out of the registrable namespace.
+let botUsername = "workflow-bot"
+
 let avatarColorFor (username: string) =
     let hash = username.ToLowerInvariant() |> Seq.fold (fun acc c -> (acc * 31 + int c) &&& 0x7fffffff) 7
     avatarPalette[hash % avatarPalette.Length]
 
-let private now () = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture)
+let now () = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture)
 
-let private readDate (r: SqliteDataReader) (i: int) =
+let readDate (r: SqliteDataReader) (i: int) =
     DateTime.Parse(r.GetString i, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)
 
 let private dbValue (value: obj) =
@@ -92,28 +95,38 @@ let private command (conn: SqliteConnection) sql (ps: (string * obj) list) =
         cmd.Parameters.AddWithValue(name, dbValue value) |> ignore
     cmd
 
-let private query conn sql ps (read: SqliteDataReader -> 'T) =
+let query conn sql ps (read: SqliteDataReader -> 'T) =
     use cmd = command conn sql ps
     use r = cmd.ExecuteReader()
     [ while r.Read() do yield read r ]
 
-let private execute conn sql ps =
+let execute conn sql ps =
     use cmd = command conn sql ps
     cmd.ExecuteNonQuery()
 
-let private insert conn sql ps =
+/// Adds a column to an existing table if an older database doesn't have it yet.
+let addColumnIfMissing (conn: SqliteConnection) (table: string) (column: string) (definition: string) =
+    let exists =
+        query conn $"SELECT 1 FROM pragma_table_info('{table}') WHERE name = @c" [ "@c", box column ] ignore
+        |> List.isEmpty
+        |> not
+
+    if not exists then
+        execute conn $"ALTER TABLE {table} ADD COLUMN {column} {definition}" [] |> ignore
+
+let insert conn sql ps =
     use cmd = command conn (sql + "; SELECT last_insert_rowid();") ps
     cmd.ExecuteScalar() :?> int64 |> int
 
-/// Columns a user row is read from, in the order `readUser` expects.
-let private userColumns alias =
+/// Columns a user row is read from, in the order `readUserAt` expects.
+let userColumns alias =
     [ "id"; "username"; "display_name"; "title"; "department"; "bio"; "avatar_color" ]
     |> List.map (fun c -> alias + "." + c)
     |> String.concat ", "
 
 let private userCols = userColumns "u"
 
-let private readUserAt (r: SqliteDataReader) offset : User =
+let readUserAt (r: SqliteDataReader) offset : User =
     { Id = r.GetInt32 offset
       Username = r.GetString(offset + 1)
       DisplayName = r.GetString(offset + 2)
@@ -202,9 +215,10 @@ type Store(connectionString: string) =
         query
             conn
             ($"SELECT {userCols} FROM users u
-               WHERE u.display_name LIKE @q OR u.username LIKE @q OR u.title LIKE @q OR u.department LIKE @q
+               WHERE (u.display_name LIKE @q OR u.username LIKE @q OR u.title LIKE @q OR u.department LIKE @q)
+                 AND u.username <> @bot
                ORDER BY u.display_name LIMIT 100")
-            [ "@q", box pattern ]
+            [ "@q", box pattern; "@bot", box botUsername ]
             (fun r -> readUserAt r 0)
 
     member this.UpdateProfile(userId: int, p: ProfileUpdate) =
@@ -323,7 +337,8 @@ type Store(connectionString: string) =
                       LikeCount = r.GetInt32 5
                       LikedByMe = r.GetInt32 6 = 1
                       Author = readUserAt r 7
-                      Comments = [] })
+                      Comments = []
+                      Workflow = None })
 
         if posts.IsEmpty then
             []

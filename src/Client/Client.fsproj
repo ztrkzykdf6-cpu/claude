@@ -8,6 +8,8 @@
     <Compile Include="Api.fs" />
     <Compile Include="Realtime.fs" />
     <Compile Include="State.fs" />
+    <Compile Include="Components.fs" />
+    <Compile Include="WorkflowView.fs" />
     <Compile Include="View.fs" />
     <Compile Include="App.fs" />
   </ItemGroup>

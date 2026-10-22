@@ -6,6 +6,7 @@
 
   <ItemGroup>
     <Compile Include="Shared.fs" />
+    <Compile Include="Workflows.fs" />
   </ItemGroup>
 
 </Project>
