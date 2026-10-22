@@ -1,0 +1,17 @@
+{
+  "name": "workplace-client",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "dotnet fable watch src/Client -o src/Client/output --run vite",
+    "build": "dotnet fable src/Client -o src/Client/output --run vite build"
+  },
+  "devDependencies": {
+    "vite": "^7.3.7"
+  },
+  "dependencies": {
+    "@microsoft/signalr": "^8.0.29",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}
