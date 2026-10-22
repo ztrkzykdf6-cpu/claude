@@ -9,6 +9,8 @@ open Shared
 
 type private HubConnection =
     abstract on: methodName: string * handler: (string -> unit) -> unit
+    [<Emit("$0.on($1, $2)")>]
+    abstract onSignal: methodName: string * handler: (unit -> unit) -> unit
     abstract onreconnected: callback: (string -> unit) -> unit
     abstract start: unit -> JS.Promise<unit>
     abstract stop: unit -> JS.Promise<unit>
@@ -24,10 +26,10 @@ let private onSettled (_promise: JS.Promise<unit>) (_ok: unit -> unit) (_error: 
 
 let private retryDelayMs (attempt: int) = if attempt < 3 then 1000 else 5000
 
-/// Opens a connection for the signed-in user. `onMessage` gets every message sent to or by them;
-/// `onReconnected` fires after a dropped connection comes back, so the caller can fetch what it missed.
-/// Disposing closes the connection.
-let connect (token: string) (onMessage: ChatMessage -> unit) (onReconnected: unit -> unit) : IDisposable =
+/// Opens a connection for the signed-in user. `onMessage` gets every message sent to or by them, and
+/// `onTasks` fires when their workflow tasks change. `onReconnected` fires after a dropped connection comes
+/// back, so the caller can fetch what it missed. Disposing closes the connection.
+let connect (token: string) (onMessage: ChatMessage -> unit) (onTasks: unit -> unit) (onReconnected: unit -> unit) : IDisposable =
     let connection =
         HubConnectionBuilder()
             .withUrl("/hubs/chat", createObj [ "accessTokenFactory" ==> fun () -> token ])
@@ -36,6 +38,7 @@ let connect (token: string) (onMessage: ChatMessage -> unit) (onReconnected: uni
             .build ()
 
     connection.on ("message", fun json -> onMessage (Json.parseNativeAs<ChatMessage> json))
+    connection.onSignal ("tasks", onTasks)
     connection.onreconnected (fun _ -> onReconnected ())
 
     let mutable stopped = false

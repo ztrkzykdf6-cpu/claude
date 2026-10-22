@@ -16,6 +16,12 @@ let workplace (token: string) : IWorkplaceApi =
     |> Remoting.withAuthorizationHeader ("Bearer " + token)
     |> Remoting.buildProxy<IWorkplaceApi>
 
+let workflows (token: string) : Workflows.IWorkflowApi =
+    Remoting.createApi ()
+    |> Remoting.withRouteBuilder Route.builder
+    |> Remoting.withAuthorizationHeader ("Bearer " + token)
+    |> Remoting.buildProxy<Workflows.IWorkflowApi>
+
 let isUnauthorized (ex: exn) =
     match ex with
     | :? ProxyRequestException as e -> e.StatusCode = 401

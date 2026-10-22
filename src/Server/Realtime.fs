@@ -40,3 +40,7 @@ let notifyMessage (hub: IHubContext<ChatHub>) (message: ChatMessage) =
             hub.Clients.Groups([ groupFor message.SenderId; groupFor message.RecipientId ]).SendAsync("message", json)
             |> Async.AwaitTask
     }
+
+/// Tells a user's open pages that their workflow tasks changed.
+let notifyTasks (hub: IHubContext<ChatHub>) (userId: int) =
+    hub.Clients.Group(groupFor userId).SendAsync("tasks") |> Async.AwaitTask
