@@ -22,7 +22,14 @@ let ``render fills known variables and blanks unknown ones`` () =
     Assert.Equal("x & ", Workflow.render vars "{{form.a}} & {{ missing }}")
 
 let private draft trigger steps =
-    { Id = 0; Name = "Test"; Description = ""; Trigger = trigger; Steps = steps }
+    { Id = 0
+      GroupId = 1
+      Name = "Test"
+      Description = ""
+      Instructions = ""
+      ResultsVisibility = GroupMembers
+      Trigger = trigger
+      Steps = steps }
 
 let private form label = CollectInput(TriggeringUser, "Form", [ { Label = label; Kind = ShortText; Required = true } ])
 
@@ -90,7 +97,9 @@ type private Env =
       Bot: User
       Messages: ResizeArray<ChatMessage>
       TaskPings: ResizeArray<int>
-      User: string -> User }
+      User: string -> User
+      /// A group the requester and approver belong to, but "other" doesn't.
+      Home: int }
 
 let private newEnv () =
     let path = Path.Combine(Path.GetTempPath(), $"workflow-tests-{Guid.NewGuid()}.db")
@@ -106,6 +115,11 @@ let private newEnv () =
             let req = { Username = name; Password = "password123"; DisplayName = name; Title = ""; Department = "" }
             name, (db.CreateUser(req, "x") |> Result.toOption |> Option.get))
         |> Map.ofList
+
+    let home =
+        db.CreateGroup(users["approver"].Id, { Name = "Home"; Description = "" }) |> Result.toOption |> Option.get
+
+    db.SetMembership(users["requester"].Id, home, true)
 
     let messages = ResizeArray()
     let pings = ResizeArray()
@@ -126,10 +140,13 @@ let private newEnv () =
       Bot = bot
       Messages = messages
       TaskPings = pings
-      User = fun name -> users[name] }
+      User = fun name -> users[name]
+      Home = home }
+
+let private homeDraft (env: Env) trigger steps = { draft trigger steps with GroupId = env.Home }
 
 let private save (env: Env) owner trigger steps =
-    let id = env.Store.Save((env.User owner).Id, draft trigger steps)
+    let id = env.Store.Save((env.User owner).Id, homeDraft env trigger steps)
     env.Store.Get id |> Option.get
 
 let private timeOff (env: Env) =
@@ -264,36 +281,129 @@ let ``scheduled workflows fire once per occurrence`` () =
 
 // ---- API permissions -----------------------------------------------------------
 
+let private api (env: Env) name = WorkflowApi.create env.Db env.Store env.Engine (env.User name)
+
+let private saved result =
+    match result with
+    | Ok(w: Workflow) -> w
+    | Error e -> failwith e
+
 [<Fact>]
-let ``only owners edit workflows, and others run only enabled manual ones`` () =
+let ``only owners edit workflows, and only group members start them`` () =
     let env = newEnv ()
-    let ownerApi = WorkflowApi.create env.Db env.Store env.Engine (env.User "approver")
-    let otherApi = WorkflowApi.create env.Db env.Store env.Engine (env.User "other")
-    let steps = [ SendMessage(TriggeringUser, "Hi {{trigger.user}}") ]
+    let ownerApi, memberApi, outsiderApi = api env "approver", api env "requester", api env "other"
+    let created = run (ownerApi.saveWorkflow (homeDraft env Manual [ SendMessage(TriggeringUser, "Hi {{trigger.user}}") ])) |> saved
 
-    let created =
-        match run (ownerApi.saveWorkflow (draft Manual steps)) with
-        | Ok w -> w
-        | Error e -> failwith e
+    Assert.True(Result.isError (run (memberApi.saveWorkflow { Workflow.toDraft created with Name = "Mine now" })))
+    Assert.True(Result.isError (run (memberApi.deleteWorkflow created.Id)))
 
-    Assert.True(Result.isError (run (otherApi.saveWorkflow { Workflow.toDraft created with Name = "Mine now" })))
-    Assert.True(Result.isError (run (otherApi.deleteWorkflow created.Id)))
-    Assert.True(Result.isError (run (otherApi.getRuns created.Id)))
+    Assert.True(Result.isOk (run (memberApi.runWorkflow created.Id)))
+    Assert.Equal(Error "Join Home to start this workflow", run (outsiderApi.runWorkflow created.Id) |> Result.map ignore)
 
-    Assert.True(Result.isOk (run (otherApi.runWorkflow created.Id)))
     run (ownerApi.setEnabled created.Id false) |> ignore
-    Assert.True(Result.isError (run (otherApi.runWorkflow created.Id)))
+    Assert.Equal(Error "This workflow is turned off", run (memberApi.runWorkflow created.Id) |> Result.map ignore)
     Assert.True(Result.isOk (run (ownerApi.runWorkflow created.Id)))
 
+    // A workflow can only be added to a group its owner belongs to.
+    Assert.True(Result.isError (run (outsiderApi.saveWorkflow (homeDraft env Manual [ SendMessage(TriggeringUser, "Hi") ]))))
+
     // Saving refuses people that don't exist.
-    let ghost = draft Manual [ SendMessage(SpecificUser 9999, "Boo") ]
-    Assert.True(Result.isError (run (ownerApi.saveWorkflow ghost)))
+    Assert.True(Result.isError (run (ownerApi.saveWorkflow (homeDraft env Manual [ SendMessage(SpecificUser 9999, "Boo") ]))))
 
     // The bot only posts in groups the owner belongs to.
-    let groupId = env.Db.CreateGroup((env.User "other").Id, { Name = "Private-ish"; Description = "" }) |> Result.toOption |> Option.get
-    let post = draft Manual [ PostToGroup(groupId, "Hello") ]
+    let other = env.Db.CreateGroup((env.User "other").Id, { Name = "Elsewhere"; Description = "" }) |> Result.toOption |> Option.get
+    let post = homeDraft env Manual [ PostToGroup(other, "Hello") ]
     Assert.Equal(Error "Step 1: join the group before posting in it", run (ownerApi.saveWorkflow post) |> Result.map ignore)
-    Assert.True(Result.isOk (run (otherApi.saveWorkflow post)))
+    Assert.True(Result.isOk (run (outsiderApi.saveWorkflow { post with GroupId = other })))
+
+[<Fact>]
+let ``results are visible to the group unless the owner keeps them private`` () =
+    let env = newEnv ()
+    let ownerApi, memberApi, outsiderApi = api env "approver", api env "requester", api env "other"
+    let created = run (ownerApi.saveWorkflow (homeDraft env Manual (timeOff env))) |> saved
+    Assert.True(Result.isOk (run (memberApi.runWorkflow created.Id)))
+
+    let runId = (env.Store.RunsFor created.Id |> List.head).Id
+    run (env.Engine.SubmitForm(env.User "requester", runId, Map [ "dates", "Friday"; "type", "Sick" ])) |> ignore
+    run (env.Engine.Decide(env.User "approver", runId, true, "Get well")) |> ignore
+
+    match run (memberApi.getResults created.Id) with
+    | Ok results ->
+        let r = Assert.Single results.Runs
+        Assert.Equal(Completed, r.Status)
+        Assert.Equal<Map<string, string>>(
+            Map [ "form.dates", "Friday"; "form.type", "Sick"; "approval.by", "approver"; "approval.comment", "Get well" ],
+            r.Values
+        )
+        Assert.False results.CanEdit
+    | Error e -> failwith e
+
+    Assert.Equal(Error "Join Home to see this workflow's results", run (outsiderApi.getResults created.Id) |> Result.map ignore)
+
+    run (ownerApi.saveWorkflow { Workflow.toDraft created with ResultsVisibility = OwnerOnly }) |> saved |> ignore
+    Assert.Equal(Error "Only the workflow's owner can see its results", run (memberApi.getResults created.Id) |> Result.map ignore)
+    Assert.True((run (ownerApi.getResults created.Id) |> Result.map (fun r -> r.CanEdit)) = Ok true)
+
+// ---- Workflow posts ----------------------------------------------------------------
+
+let private feedApi (env: Env) name =
+    let hooks: Api.WorkflowHooks =
+        { OnPostCreated = env.Engine.OnPostCreated
+          Decorate = WorkflowApi.decoratePosts env.Db env.Store
+          IsWorkflowPost = env.Store.IsWorkflowPost
+          BotId = env.Bot.Id }
+
+    Api.workplace env.Db (fun _ -> async { return () }) hooks (env.User name) "token"
+
+let private workflowPosts (env: Env) name groupId =
+    run ((feedApi env name).getFeed(GroupFeed groupId)) |> List.filter (fun p -> p.Workflow.IsSome)
+
+[<Fact>]
+let ``a workflow lives as a post in its group, explaining how to run it`` () =
+    let env = newEnv ()
+    let created = run ((api env "approver").saveWorkflow (homeDraft env Manual (timeOff env))) |> saved
+
+    let post = Assert.Single(workflowPosts env "requester" env.Home)
+    let card = post.Workflow.Value
+    Assert.Equal((env.User "approver").Id, post.Author.Id)
+    Assert.Equal(created.Id, card.WorkflowId)
+    Assert.Equal("Click Start workflow, then fill in the \"Time off\" form under My tasks.", card.HowToRun)
+    Assert.True card.CanStart
+    Assert.True card.CanSeeResults
+    Assert.False card.CanEdit
+    Assert.Equal(0, card.RunCount)
+
+    // Outsiders can read the group, but can't start the workflow from its post.
+    Assert.False((Assert.Single(workflowPosts env "other" env.Home)).Workflow.Value.CanStart)
+
+    run ((api env "requester").runWorkflow created.Id) |> ignore
+    Assert.Equal(1, (Assert.Single(workflowPosts env "requester" env.Home)).Workflow.Value.RunCount)
+
+    // The post can't be deleted on its own...
+    Assert.True(Result.isError (run ((feedApi env "approver").deletePost post.Id)))
+
+    // ...it moves with the workflow...
+    let elsewhere = env.Db.CreateGroup((env.User "approver").Id, { Name = "Elsewhere"; Description = "" }) |> Result.toOption |> Option.get
+    run ((api env "approver").saveWorkflow { Workflow.toDraft created with GroupId = elsewhere }) |> saved |> ignore
+    Assert.Empty(workflowPosts env "approver" env.Home)
+    Assert.Equal(post.Id, (Assert.Single(workflowPosts env "approver" elsewhere)).Id)
+
+    // ...and goes away with it.
+    run ((api env "approver").deleteWorkflow created.Id) |> ignore
+    Assert.Empty(run ((feedApi env "approver").getFeed(GroupFeed elsewhere)))
+
+[<Fact>]
+let ``automatic workflows explain that they run by themselves`` () =
+    let name _ = "Engineering"
+    Assert.Equal(
+        "Runs by itself when a post in Engineering mentions \"bug\". There's nothing to click.",
+        Workflow.howToRun name true (NewGroupPost(2, " bug ")) []
+    )
+    Assert.Equal(
+        "Runs by itself: Weekdays at 09:30 (UTC). There's nothing to click.",
+        Workflow.howToRun name true (Scheduled { Days = [ 5; 1; 2; 3; 4 ]; Hour = 9; Minute = 30; TimeZone = "UTC" }) []
+    )
+    Assert.StartsWith("This workflow is turned off", Workflow.howToRun name false Manual [])
 
 [<Fact>]
 let ``the demo workflows are valid`` () =
@@ -304,8 +414,43 @@ let ``the demo workflows are valid`` () =
     store.Initialize()
     Seed.run db store
 
-    let workflows = (store.ListFor 0) @ (store.Scheduled() |> List.map fst) @ (store.ForGroupPosts 2)
-    Assert.Equal(3, workflows |> List.distinctBy (fun w -> w.Id) |> List.length)
+    // Alex belongs to every group with a demo workflow.
+    let alex = db.FindCredentials "alex" |> Option.get |> fst
+    let workflows = store.ListFor alex.Id
+    Assert.Equal(3, workflows.Length)
 
     for w in workflows do
         Assert.Equal(Ok(), Workflow.validate (Workflow.toDraft w))
+
+[<Fact>]
+let ``older databases get the new workflow columns`` () =
+    let path = Path.Combine(Path.GetTempPath(), $"workflow-migrate-{Guid.NewGuid()}.db")
+    let db = Db.Store($"Data Source={path};Pooling=False")
+    db.Initialize()
+
+    // The workflows table as the first version of the feature created it.
+    do
+        use conn = db.Open()
+
+        Db.execute
+            conn
+            "CREATE TABLE workflows (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL, name TEXT NOT NULL,
+                 description TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, trigger_kind TEXT NOT NULL,
+                 trigger_group INTEGER, trigger_json TEXT NOT NULL, steps_json TEXT NOT NULL,
+                 last_fired_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             INSERT INTO users (username, password_hash, display_name, avatar_color, created_at)
+             VALUES ('old', 'x', 'Old Owner', '#000', '2026-01-01T00:00:00Z');
+             INSERT INTO workflows (owner_id, name, trigger_kind, trigger_json, steps_json, last_fired_at, updated_at)
+             VALUES (1, 'Legacy', 'manual', '\"Manual\"', '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');"
+            []
+        |> ignore
+
+    let store = WorkflowDb.WorkflowStore(db)
+    store.Initialize()
+    store.Initialize() // running it again is harmless
+
+    let legacy = store.Get 1 |> Option.get
+    Assert.Equal("Legacy", legacy.Name)
+    Assert.Equal(0, legacy.GroupId)
+    Assert.Equal(GroupMembers, legacy.ResultsVisibility)

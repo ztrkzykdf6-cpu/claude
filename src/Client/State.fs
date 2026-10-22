@@ -18,7 +18,7 @@ type Page =
     | Profile of User
     | WorkflowsPage of WorkflowTab
     | WorkflowEditor
-    | WorkflowHistory of Workflow
+    | WorkflowResultsPage of workflowId: int
 
 type AuthMode =
     | SignIn
@@ -57,7 +57,7 @@ type AppModel =
       Workflows: Workflow list
       /// Paused workflow runs waiting on the current user.
       Tasks: PendingTask list
-      Runs: WorkflowRun list
+      Results: WorkflowResults option
       Editor: WorkflowDraft
       Saving: bool
       /// Form answers being typed, by run id and field key.
@@ -144,7 +144,7 @@ type Msg =
     | WorkflowUpdated of Result<Workflow, string>
     | RunWorkflow of workflowId: int
     | WorkflowStarted of Result<WorkflowRun, string>
-    | RunsLoaded of workflowId: int * Result<WorkflowRun list, string>
+    | ResultsLoaded of workflowId: int * Result<WorkflowResults, string>
     | SetTaskAnswer of runId: int * key: string * value: string
     | SetTaskComment of runId: int * string
     | SubmitTask of runId: int
@@ -163,8 +163,11 @@ let private emptyAuth =
 
 let private emptyDraft =
     { Id = 0
+      GroupId = 0
       Name = ""
       Description = ""
+      Instructions = ""
+      ResultsVisibility = GroupMembers
       Trigger = Manual
       Steps = [] }
 
@@ -189,7 +192,7 @@ let private appModel token me =
       ProfileDraft = None
       Workflows = []
       Tasks = []
-      Runs = []
+      Results = None
       Editor = emptyDraft
       Saving = false
       TaskAnswers = Map.empty
@@ -238,13 +241,21 @@ let private appendMessages partnerId (incoming: ChatMessage list) (m: AppModel) 
         { m with Messages = m.Messages @ fresh |> List.sortBy (fun x -> x.Id) }
     | _ -> m
 
+/// Reloads what the current page shows after a workflow run changes it (run counts, results).
+let private refreshPage (m: AppModel) =
+    match m.Page with
+    | Feed feed -> loadFeed m feed
+    | WorkflowsPage _ -> loadWorkflows m
+    | WorkflowResultsPage id -> Cmd.OfAsync.either (fun () -> m.WorkflowApi.getResults id) () (fun r -> ResultsLoaded(id, r)) Failed
+    | _ -> Cmd.none
+
 let private notice text m = { m with Notice = Some text }, Cmd.none
 
 let private navigate page (m: AppModel) =
     let m = { m with Page = page; Notice = None; ProfileDraft = None }
 
     match page with
-    | Feed feed -> { m with Posts = []; PostsLoading = true }, Cmd.batch [ loadFeed m feed; loadGroups m ]
+    | Feed feed -> { m with Posts = []; PostsLoading = true }, Cmd.batch [ loadFeed m feed; loadGroups m; loadWorkflows m ]
     | Groups -> m, loadGroups m
     | People -> m, call m.Api.getPeople m.PeopleSearch (fun people -> PeopleLoaded(m.PeopleSearch, people))
     | Chat partner ->
@@ -259,9 +270,9 @@ let private navigate page (m: AppModel) =
     | Profile _ -> m, Cmd.none
     | WorkflowsPage _ -> m, Cmd.batch [ loadWorkflows m; loadTasks m; loadGroups m ]
     | WorkflowEditor -> m, Cmd.batch [ call m.Api.getPeople "" DirectoryLoaded; loadGroups m ]
-    | WorkflowHistory w ->
-        { m with Runs = [] },
-        Cmd.OfAsync.either (fun () -> m.WorkflowApi.getRuns w.Id) () (fun r -> RunsLoaded(w.Id, r)) Failed
+    | WorkflowResultsPage id ->
+        { m with Results = None },
+        Cmd.OfAsync.either (fun () -> m.WorkflowApi.getResults id) () (fun r -> ResultsLoaded(id, r)) Failed
 
 let private updateAuth msg (a: AuthModel) : Model * Cmd<Msg> =
     match msg with
@@ -411,7 +422,14 @@ let private updateApp msg (m: AppModel) : Model * Cmd<Msg> =
     | TasksLoaded tasks -> App { m with Tasks = tasks }, Cmd.none
     | TasksChanged -> App m, loadTasks m
     | DirectoryLoaded people -> App { m with Directory = people }, Cmd.none
-    | NewWorkflow -> navigate WorkflowEditor { m with Editor = emptyDraft } |> stay
+    | NewWorkflow ->
+        // Start in the group being viewed, or else the first group the user belongs to.
+        let group =
+            match m.Page with
+            | Feed(GroupFeed g) -> g
+            | _ -> m.Groups |> List.tryFind (fun g -> g.IsMember) |> Option.map (fun g -> g.Id) |> Option.defaultValue 0
+
+        navigate WorkflowEditor { m with Editor = { emptyDraft with GroupId = group } } |> stay
     | OpenWorkflowEditor w -> navigate WorkflowEditor { m with Editor = Workflow.toDraft w } |> stay
     | EditWorkflow draft -> App { m with Editor = draft }, Cmd.none
     | SaveWorkflow when not m.Saving ->
@@ -446,10 +464,9 @@ let private updateApp msg (m: AppModel) : Model * Cmd<Msg> =
             | WaitingForInput u when u.Id = m.Me.Id -> true
             | _ -> false
 
-        let m, cmd = if goToTasks then navigate (WorkflowsPage MyTasks) m else m, loadTasks m
+        let m, cmd = if goToTasks then navigate (WorkflowsPage MyTasks) m else m, Cmd.batch [ loadTasks m; refreshPage m ]
         App { m with Notice = Some text }, cmd
-    | RunsLoaded(id, Ok runs) when (match m.Page with WorkflowHistory w -> w.Id = id | _ -> false) ->
-        App { m with Runs = runs }, Cmd.none
+    | ResultsLoaded(id, Ok results) when m.Page = WorkflowResultsPage id -> App { m with Results = Some results }, Cmd.none
     | SetTaskAnswer(runId, key, value) ->
         let answers = m.TaskAnswers |> Map.tryFind runId |> Option.defaultValue Map.empty
         App { m with TaskAnswers = m.TaskAnswers.Add(runId, answers.Add(key, value)) }, Cmd.none
@@ -469,7 +486,7 @@ let private updateApp msg (m: AppModel) : Model * Cmd<Msg> =
                 TaskAnswers = m.TaskAnswers.Remove runId
                 TaskComments = m.TaskComments.Remove runId
                 Notice = Some "Done. The workflow has moved on." },
-        loadTasks m
+        Cmd.batch [ loadTasks m; refreshPage m ]
 
     | PostCreated(Error e)
     | PostDeleted(_, Error e)
@@ -480,7 +497,7 @@ let private updateApp msg (m: AppModel) : Model * Cmd<Msg> =
     | WorkflowDeleted(_, Error e)
     | WorkflowUpdated(Error e)
     | WorkflowStarted(Error e)
-    | RunsLoaded(_, Error e)
+    | ResultsLoaded(_, Error e)
     | TaskDone(_, Error e) -> notice e m |> stay
 
     | _ -> App m, Cmd.none

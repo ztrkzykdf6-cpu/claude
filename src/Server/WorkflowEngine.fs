@@ -63,6 +63,7 @@ let toApiRun (row: RunRow) : WorkflowRun =
       TriggeredBy = row.TriggeredBy
       StartedAt = row.CreatedAt
       Log = row.Log
+      Values = row.Variables |> Map.filter (fun name _ -> Workflow.isResultVariable name)
       Status =
         match row.Status with
         | "running" -> Running

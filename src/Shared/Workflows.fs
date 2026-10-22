@@ -50,11 +50,21 @@ type Step =
     /// Continues only when the comparison holds (case-insensitive); otherwise the run stops.
     | Condition of left: string * op: CompareOp * right: string
 
+type ResultsVisibility =
+    | GroupMembers
+    | OwnerOnly
+
 type Workflow =
     { Id: int
       Owner: User
+      /// The group the workflow lives in, as a post in its feed.
+      GroupId: int
+      GroupName: string
       Name: string
       Description: string
+      /// Extra guidance from the owner, shown on the workflow's post.
+      Instructions: string
+      ResultsVisibility: ResultsVisibility
       Enabled: bool
       Trigger: Trigger
       Steps: Step list
@@ -63,8 +73,11 @@ type Workflow =
 /// What the builder saves; `Id = 0` creates a new workflow.
 type WorkflowDraft =
     { Id: int
+      GroupId: int
       Name: string
       Description: string
+      Instructions: string
+      ResultsVisibility: ResultsVisibility
       Trigger: Trigger
       Steps: Step list }
 
@@ -85,7 +98,15 @@ type WorkflowRun =
       TriggeredBy: User option
       Status: RunStatus
       StartedAt: DateTime
-      Log: RunLogEntry list }
+      Log: RunLogEntry list
+      /// Form answers, approval details and the triggering post, keyed like template variables.
+      Values: Map<string, string> }
+
+/// A workflow with its runs, newest first, for the results page.
+type WorkflowResults =
+    { Workflow: Workflow
+      Runs: WorkflowRun list
+      CanEdit: bool }
 
 type TaskKind =
     | FormTask of title: string * fields: FormField list
@@ -187,7 +208,8 @@ module Workflow =
     /// Checks a draft before saving; the server runs the same checks.
     let validate (draft: WorkflowDraft) : Result<unit, string> =
         let errors =
-            [ if String.IsNullOrWhiteSpace draft.Name then "Give the workflow a name"
+            [ if draft.GroupId <= 0 then "Choose the group this workflow belongs to"
+              if String.IsNullOrWhiteSpace draft.Name then "Give the workflow a name"
               if draft.Name.Length > 80 then "Keep the name under 80 characters"
               match draft.Trigger with
               | Manual -> ()
@@ -225,21 +247,81 @@ module Workflow =
 
     let toDraft (w: Workflow) : WorkflowDraft =
         { Id = w.Id
+          GroupId = w.GroupId
           Name = w.Name
           Description = w.Description
+          Instructions = w.Instructions
+          ResultsVisibility = w.ResultsVisibility
           Trigger = w.Trigger
           Steps = w.Steps }
 
+    let private pad (n: int) = (string n).PadLeft(2, '0')
+
+    let describeSchedule (s: Schedule) =
+        let days =
+            match List.sort s.Days with
+            | [ 0; 1; 2; 3; 4; 5; 6 ] -> "Every day"
+            | [ 1; 2; 3; 4; 5 ] -> "Weekdays"
+            | days -> days |> List.map (fun d -> dayNames[d]) |> String.concat ", "
+
+        sprintf "%s at %s:%s (%s)" days (pad s.Hour) (pad s.Minute) s.TimeZone
+
+    /// One-line summary of what starts a workflow; `groupName` looks up group names by id.
+    let describeTrigger (groupName: int -> string) trigger =
+        match trigger with
+        | Manual -> "Started from the Start workflow button"
+        | NewGroupPost(groupId, keyword) when keyword.Trim() = "" -> sprintf "When someone posts in %s" (groupName groupId)
+        | NewGroupPost(groupId, keyword) -> sprintf "When a post in %s mentions \"%s\"" (groupName groupId) (keyword.Trim())
+        | Scheduled s -> describeSchedule s
+
+    /// Plain-language instructions for starting a workflow, shown on its post.
+    let howToRun (groupName: int -> string) (enabled: bool) (trigger: Trigger) (steps: Step list) =
+        if not enabled then
+            "This workflow is turned off, so it won't run until its owner turns it on."
+        else
+            match trigger with
+            | Manual ->
+                match steps with
+                | CollectInput(TriggeringUser, title, _) :: _ when title.Trim() <> "" ->
+                    sprintf "Click Start workflow, then fill in the \"%s\" form under My tasks." (title.Trim())
+                | _ -> "Click Start workflow. It runs straight away."
+            | NewGroupPost(groupId, keyword) when keyword.Trim() = "" ->
+                sprintf "Runs by itself whenever someone posts in %s. There's nothing to click." (groupName groupId)
+            | NewGroupPost(groupId, keyword) ->
+                sprintf "Runs by itself when a post in %s mentions \"%s\". There's nothing to click." (groupName groupId) (keyword.Trim())
+            | Scheduled s -> sprintf "Runs by itself: %s. There's nothing to click." (describeSchedule s)
+
+    /// Columns for the results table: each form field, approval details and the triggering post, as
+    /// (variable, heading) pairs matching `WorkflowRun.Values`.
+    let resultColumns (trigger: Trigger) (steps: Step list) =
+        [ match trigger with
+          | NewGroupPost _ -> "trigger.post", "Post"
+          | _ -> ()
+          for step in steps do
+              match step with
+              | CollectInput(_, _, fields) ->
+                  for f in fields do
+                      "form." + fieldKey f.Label, f.Label
+              | RequestApproval _ ->
+                  "approval.by", "Approved by"
+                  "approval.comment", "Approval comment"
+              | _ -> () ]
+        |> List.distinctBy fst
+
+    /// Values from a run's variables worth showing as results.
+    let isResultVariable (name: string) =
+        name.StartsWith "form." || name.StartsWith "approval." || name = "trigger.post"
+
 /// Workflow endpoints; like IWorkplaceApi they need a bearer token.
 type IWorkflowApi =
-    { /// Workflows the user owns, plus everyone's enabled manual workflows.
+    { /// Workflows the user owns, plus those in groups they belong to.
       getWorkflows: unit -> Async<Workflow list>
       saveWorkflow: WorkflowDraft -> Async<Result<Workflow, string>>
       deleteWorkflow: int -> Async<Result<unit, string>>
       setEnabled: int -> bool -> Async<Result<Workflow, string>>
       runWorkflow: int -> Async<Result<WorkflowRun, string>>
-      /// Recent runs of a workflow the user owns.
-      getRuns: int -> Async<Result<WorkflowRun list, string>>
+      /// A workflow's recent runs, for its owner or, if allowed, members of its group.
+      getResults: int -> Async<Result<WorkflowResults, string>>
       getTasks: unit -> Async<PendingTask list>
       submitForm: int -> (string * string) list -> Async<Result<unit, string>>
       decideApproval: int -> bool -> string -> Async<Result<unit, string>> }

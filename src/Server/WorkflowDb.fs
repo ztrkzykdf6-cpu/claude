@@ -68,6 +68,18 @@ type RunRow =
       Log: RunLogEntry list
       CreatedAt: DateTime }
 
+// Columns added after the first version of the table; Initialize adds them to older databases.
+let private laterColumns =
+    [ "group_id", "INTEGER REFERENCES work_groups(id) ON DELETE CASCADE"
+      "post_id", "INTEGER REFERENCES posts(id) ON DELETE SET NULL"
+      "instructions", "TEXT NOT NULL DEFAULT ''"
+      "results_visibility", "TEXT NOT NULL DEFAULT 'group'" ]
+
+let private visibilityColumn =
+    function
+    | GroupMembers -> "group"
+    | OwnerOnly -> "owner"
+
 let private triggerColumns trigger =
     match trigger with
     | Manual -> "manual", None
@@ -80,8 +92,14 @@ type WorkflowStore(db: Store) =
 
     let workflowSql where =
         $"SELECT w.id, w.name, w.description, w.enabled, w.trigger_json, w.steps_json, w.updated_at, w.last_fired_at,
-                 {userCols}
-          FROM workflows w JOIN users u ON u.id = w.owner_id {where}"
+                 w.group_id, g.name, w.instructions, w.results_visibility, {userCols}, w.post_id
+          FROM workflows w
+          JOIN users u ON u.id = w.owner_id
+          LEFT JOIN work_groups g ON g.id = w.group_id
+          {where}"
+
+    // After the seven user columns that start at 12.
+    let postIdColumn = 19
 
     let readWorkflow (r: SqliteDataReader) =
         { Id = r.GetInt32 0
@@ -91,7 +109,11 @@ type WorkflowStore(db: Store) =
           Trigger = fromJson<Trigger> (r.GetString 4)
           Steps = fromJson<Step list> (r.GetString 5)
           UpdatedAt = readDate r 6
-          Owner = readUserAt r 8 },
+          GroupId = if r.IsDBNull 8 then 0 else r.GetInt32 8
+          GroupName = if r.IsDBNull 9 then "" else r.GetString 9
+          Instructions = r.GetString 10
+          ResultsVisibility = if r.GetString 11 = "owner" then OwnerOnly else GroupMembers
+          Owner = readUserAt r 12 },
         readDate r 7
 
     let runSql where =
@@ -120,6 +142,9 @@ type WorkflowStore(db: Store) =
         use conn = db.Open()
         execute conn schema [] |> ignore
 
+        for column, definition in laterColumns do
+            addColumnIfMissing conn "workflows" column definition
+
     /// Returns the Workflow Bot account, creating it on first use. Its password hash never verifies.
     member _.EnsureBot() : User =
         use conn = db.Open()
@@ -135,39 +160,68 @@ type WorkflowStore(db: Store) =
 
     // ---- Workflows -------------------------------------------------------------
 
-    /// Inserts (`Id = 0`) or updates a workflow. Saving resets the schedule clock so an edit never fires a missed run.
+    /// Inserts (`Id = 0`) or updates a workflow, keeping its post in its group: created with the workflow, moved
+    /// when the group changes. Saving resets the schedule clock so an edit never fires a missed run.
     member _.Save(ownerId: int, draft: WorkflowDraft) : int =
         use conn = db.Open()
-        let kind, group = triggerColumns draft.Trigger
+        use tx = conn.BeginTransaction()
+        let kind, triggerGroup = triggerColumns draft.Trigger
         let stamp = now ()
 
         let ps =
             [ "@owner", box ownerId
               "@name", box (draft.Name.Trim())
               "@desc", box (draft.Description.Trim())
+              "@instructions", box (draft.Instructions.Trim())
+              "@visibility", box (visibilityColumn draft.ResultsVisibility)
+              "@group", box draft.GroupId
               "@kind", box kind
-              "@group", box group
+              "@tgroup", box triggerGroup
               "@trigger", box (toJson draft.Trigger)
               "@steps", box (toJson draft.Steps)
               "@now", box stamp
               "@id", box draft.Id ]
 
-        if draft.Id = 0 then
-            insert
-                conn
-                "INSERT INTO workflows (owner_id, name, description, trigger_kind, trigger_group, trigger_json, steps_json, last_fired_at, updated_at)
-                 VALUES (@owner, @name, @desc, @kind, @group, @trigger, @steps, @now, @now)"
-                ps
-        else
-            execute
-                conn
-                "UPDATE workflows SET name = @name, description = @desc, trigger_kind = @kind, trigger_group = @group,
-                        trigger_json = @trigger, steps_json = @steps, last_fired_at = @now, updated_at = @now
-                 WHERE id = @id AND owner_id = @owner"
-                ps
-            |> ignore
+        let id =
+            if draft.Id = 0 then
+                insert
+                    conn
+                    "INSERT INTO workflows (owner_id, group_id, name, description, instructions, results_visibility,
+                                            trigger_kind, trigger_group, trigger_json, steps_json, last_fired_at, updated_at)
+                     VALUES (@owner, @group, @name, @desc, @instructions, @visibility, @kind, @tgroup, @trigger, @steps, @now, @now)"
+                    ps
+            else
+                execute
+                    conn
+                    "UPDATE workflows SET group_id = @group, name = @name, description = @desc, instructions = @instructions,
+                            results_visibility = @visibility, trigger_kind = @kind, trigger_group = @tgroup,
+                            trigger_json = @trigger, steps_json = @steps, last_fired_at = @now, updated_at = @now
+                     WHERE id = @id AND owner_id = @owner"
+                    ps
+                |> ignore
 
-            draft.Id
+                draft.Id
+
+        let postId =
+            query conn "SELECT post_id FROM workflows WHERE id = @id" [ "@id", box id ] (fun r ->
+                if r.IsDBNull 0 then None else Some(r.GetInt32 0))
+            |> List.tryHead
+            |> Option.flatten
+
+        match postId with
+        | Some p ->
+            execute conn "UPDATE posts SET group_id = @g WHERE id = @p" [ "@g", box draft.GroupId; "@p", box p ] |> ignore
+        | None ->
+            let p =
+                insert
+                    conn
+                    "INSERT INTO posts (author_id, group_id, body, created_at) VALUES (@owner, @group, '', @now)"
+                    ps
+
+            execute conn "UPDATE workflows SET post_id = @p WHERE id = @id" [ "@p", box p; "@id", box id ] |> ignore
+
+        tx.Commit()
+        id
 
     member _.Get(id: int) : Workflow option =
         use conn = db.Open()
@@ -177,14 +231,50 @@ type WorkflowStore(db: Store) =
         use conn = db.Open()
         query
             conn
-            (workflowSql "WHERE w.owner_id = @me OR (w.enabled = 1 AND w.trigger_kind = 'manual') ORDER BY w.name COLLATE NOCASE")
+            (workflowSql
+                "WHERE w.owner_id = @me OR w.group_id IN (SELECT group_id FROM group_members WHERE user_id = @me)
+                 ORDER BY g.name COLLATE NOCASE, w.name COLLATE NOCASE")
             [ "@me", box userId ]
             readWorkflow
         |> List.map fst
 
+    /// Workflows whose post is among `postIds`, keyed by post id.
+    member _.ForPosts(postIds: int list) : Map<int, Workflow> =
+        if postIds.IsEmpty then
+            Map.empty
+        else
+            use conn = db.Open()
+            // ids are integers from the database, so inlining them is safe.
+            let ids = postIds |> List.map string |> String.concat ","
+
+            query conn (workflowSql $"WHERE w.post_id IN ({ids})") [] (fun r -> r.GetInt32 postIdColumn, fst (readWorkflow r))
+            |> Map.ofList
+
+    member _.IsWorkflowPost(postId: int) =
+        use conn = db.Open()
+        query conn "SELECT 1 FROM workflows WHERE post_id = @p" [ "@p", box postId ] ignore |> List.isEmpty |> not
+
+    member _.RunCounts(workflowIds: int list) : Map<int, int> =
+        if workflowIds.IsEmpty then
+            Map.empty
+        else
+            use conn = db.Open()
+            let ids = workflowIds |> List.map string |> String.concat ","
+
+            query
+                conn
+                $"SELECT workflow_id, COUNT(*) FROM workflow_runs WHERE workflow_id IN ({ids}) GROUP BY workflow_id"
+                []
+                (fun r -> r.GetInt32 0, r.GetInt32 1)
+            |> Map.ofList
+
+    /// Deletes a workflow with its post and runs.
     member _.Delete(id: int) =
         use conn = db.Open()
+        use tx = conn.BeginTransaction()
+        execute conn "DELETE FROM posts WHERE id = (SELECT post_id FROM workflows WHERE id = @id)" [ "@id", box id ] |> ignore
         execute conn "DELETE FROM workflows WHERE id = @id" [ "@id", box id ] |> ignore
+        tx.Commit()
 
     member _.SetEnabled(id: int, enabled: bool) =
         use conn = db.Open()

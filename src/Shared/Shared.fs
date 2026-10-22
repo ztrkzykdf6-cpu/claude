@@ -27,6 +27,20 @@ type Comment =
       Body: string
       CreatedAt: DateTime }
 
+/// What a workflow's post in its group shows: how to run it, and what the viewer may do with it.
+type WorkflowCard =
+    { WorkflowId: int
+      Name: string
+      Description: string
+      HowToRun: string
+      Instructions: string
+      Enabled: bool
+      IsManual: bool
+      RunCount: int
+      CanStart: bool
+      CanSeeResults: bool
+      CanEdit: bool }
+
 type Post =
     { Id: int
       Author: User
@@ -36,7 +50,9 @@ type Post =
       CreatedAt: DateTime
       LikeCount: int
       LikedByMe: bool
-      Comments: Comment list }
+      Comments: Comment list
+      /// Set when the post is a workflow's home in its group.
+      Workflow: WorkflowCard option }
 
 type ChatMessage =
     { Id: int

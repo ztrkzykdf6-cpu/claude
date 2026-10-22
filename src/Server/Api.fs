@@ -51,18 +51,22 @@ let auth (db: Store) : IAuthApi =
             } }
 
 /// The API as seen by one signed-in user; built per request from the authenticated session.
-/// `notify` pushes a newly sent chat message to the participants' live connections, `onPostCreated` lets
-/// workflows react to new posts, and `botId` identifies the Workflow Bot account, which can't be messaged.
-let workplace
-    (db: Store)
-    (notify: ChatMessage -> Async<unit>)
-    (onPostCreated: Post -> Async<unit>)
-    (botId: int)
-    (me: User)
-    (token: string)
-    : IWorkplaceApi =
+/// How the feed API works with workflows, which are compiled after it.
+type WorkflowHooks =
+    { /// Lets workflows react to a new post.
+      OnPostCreated: Post -> Async<unit>
+      /// Adds workflow cards to posts that are a workflow's home in its group.
+      Decorate: User -> Post list -> Post list
+      IsWorkflowPost: int -> bool
+      /// The Workflow Bot account, which can't be messaged.
+      BotId: int }
+
+/// `notify` pushes a newly sent chat message to the participants' live connections.
+let workplace (db: Store) (notify: ChatMessage -> Async<unit>) (hooks: WorkflowHooks) (me: User) (token: string) : IWorkplaceApi =
+    let decorate = hooks.Decorate me
+
     let post postId =
-        match db.GetPost(me.Id, postId) with
+        match db.GetPost(me.Id, postId) |> Option.map (List.singleton >> decorate >> List.head) with
         | Some p -> p
         | None -> raise (NotFound "That post no longer exists")
 
@@ -75,7 +79,7 @@ let workplace
 
       logout = fun () -> async { db.DeleteSession(Auth.hashToken token) }
 
-      getFeed = fun feed -> async { return db.GetFeed(me.Id, feed) }
+      getFeed = fun feed -> async { return db.GetFeed(me.Id, feed) |> decorate }
 
       createPost =
         fun np ->
@@ -91,7 +95,7 @@ let workplace
                     | Some g when not (db.IsMember(me.Id, g)) -> return Error "Join the group to post in it"
                     | groupId ->
                         let created = post (db.CreatePost(me.Id, groupId, body))
-                        do! onPostCreated created
+                        do! hooks.OnPostCreated created
                         return Ok created
             }
 
@@ -102,6 +106,7 @@ let workplace
                     match db.PostAuthor postId with
                     | None -> Error "That post no longer exists"
                     | Some author when author <> me.Id -> Error "You can only delete your own posts"
+                    | Some _ when hooks.IsWorkflowPost postId -> Error "This post belongs to a workflow. Delete the workflow instead."
                     | Some _ -> Ok(db.DeletePost postId)
             }
 
@@ -178,7 +183,7 @@ let workplace
                     return Error $"Messages are limited to {Validation.maxMessageLength} characters"
                 elif recipientId = me.Id then
                     return Error "You can't message yourself"
-                elif recipientId = botId then
+                elif recipientId = hooks.BotId then
                     return Error "Workflow Bot only sends messages and can't read replies"
                 elif (db.GetUser recipientId).IsNone then
                     return Error "That person no longer exists"

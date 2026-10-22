@@ -157,7 +157,9 @@ let private postCard (m: AppModel) (post: Post) dispatch =
                         ]
                 ]
             ]
-            Html.p [ prop.className "post-body"; prop.text post.Body ]
+            match post.Workflow with
+            | Some card -> WorkflowView.postCard card dispatch
+            | None -> Html.p [ prop.className "post-body"; prop.text post.Body ]
             Html.div [
                 prop.className "post-stats muted small"
                 prop.children [
@@ -257,9 +259,18 @@ let private feedPage (m: AppModel) feed dispatch =
                                 prop.text (sprintf "%d member%s" g.MemberCount (if g.MemberCount = 1 then "" else "s"))
                             ]
                         ]
-                        membershipButton g dispatch
+                        Html.div [
+                            prop.className "row banner-actions"
+                            prop.children [
+                                if g.IsMember then
+                                    button "btn" "⚡ Add workflow" (fun () -> dispatch NewWorkflow)
+                                membershipButton g dispatch
+                            ]
+                        ]
                     ]
                 ]
+
+                WorkflowView.groupWorkflows m g.Id dispatch
 
                 if g.IsMember then
                     composer m (sprintf "Post in %s…" g.Name) dispatch
@@ -548,7 +559,7 @@ let private appView (m: AppModel) dispatch =
                                 (match m.Page with
                                  | WorkflowsPage _
                                  | WorkflowEditor
-                                 | WorkflowHistory _ -> true
+                                 | WorkflowResultsPage _ -> true
                                  | _ -> false)
                                 m.Tasks.Length
                                 dispatch
@@ -589,7 +600,7 @@ let private appView (m: AppModel) dispatch =
                             | Profile user -> profilePage m user dispatch
                             | WorkflowsPage tab -> WorkflowView.workflowsPage m tab dispatch
                             | WorkflowEditor -> WorkflowView.editorPage m dispatch
-                            | WorkflowHistory w -> WorkflowView.historyPage m w dispatch
+                            | WorkflowResultsPage id -> WorkflowView.resultsPage m id dispatch
                         ]
                     ]
                 ]

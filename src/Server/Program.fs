@@ -52,6 +52,12 @@ let private webApp
                 logger.LogError(ex, "Starting workflows for post {PostId} failed", post.Id)
         }
 
+    let hooks: Api.WorkflowHooks =
+        { OnPostCreated = onPostCreated
+          Decorate = WorkflowApi.decoratePosts db store
+          IsWorkflowPost = store.IsWorkflowPost
+          BotId = engine.Bot.Id }
+
     let authApi =
         Remoting.createApi ()
         |> Remoting.withRouteBuilder Route.builder
@@ -66,8 +72,7 @@ let private webApp
             Api.workplace
                 db
                 (Realtime.notifyMessage hub)
-                onPostCreated
-                engine.Bot.Id
+                hooks
                 (ctx.Items[userKey] :?> User)
                 (ctx.Items[tokenKey] :?> string))
         |> Remoting.withErrorHandler (errorHandler logger)

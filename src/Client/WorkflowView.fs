@@ -1,4 +1,4 @@
-/// Workflow Builder pages: the workflow list, the editor, the tasks inbox and run history.
+/// Workflow Builder pages: workflow cards in group feeds, the workflow list, the editor, the tasks inbox and results.
 module WorkflowView
 
 open System
@@ -26,19 +26,17 @@ let private personName (m: AppModel) recipient =
         |> Option.map (fun u -> u.DisplayName)
         |> Option.defaultValue "a specific person"
 
-let describeTrigger (m: AppModel) trigger =
-    match trigger with
-    | Manual -> "Started from the Run button"
-    | NewGroupPost(groupId, keyword) when keyword.Trim() = "" -> sprintf "When someone posts in %s" (groupName m groupId)
-    | NewGroupPost(groupId, keyword) -> sprintf "When a post in %s mentions \"%s\"" (groupName m groupId) (keyword.Trim())
-    | Scheduled s ->
-        let days =
-            match List.sort s.Days with
-            | [ 0; 1; 2; 3; 4; 5; 6 ] -> "Every day"
-            | [ 1; 2; 3; 4; 5 ] -> "Weekdays"
-            | days -> days |> List.map (fun d -> Workflow.dayNames[d]) |> String.concat ", "
+let describeTrigger (m: AppModel) trigger = Workflow.describeTrigger (groupName m) trigger
 
-        sprintf "%s at %s:%s (%s)" days (pad s.Hour) (pad s.Minute) s.TimeZone
+let private isMember (m: AppModel) groupId =
+    m.Groups |> List.exists (fun g -> g.Id = groupId && g.IsMember)
+
+// Mirrors the server's rules, which have the final say.
+let private canStart (m: AppModel) (w: Workflow) =
+    w.Trigger = Manual && (w.Owner.Id = m.Me.Id || (w.Enabled && isMember m w.GroupId))
+
+let private canSeeResults (m: AppModel) (w: Workflow) =
+    w.Owner.Id = m.Me.Id || (w.ResultsVisibility = GroupMembers && isMember m w.GroupId)
 
 let private stepInfo step =
     match step with
@@ -368,6 +366,41 @@ let editorPage (m: AppModel) dispatch =
                         (textInput draft.Description "What does it do?" (fun v -> dispatch (EditWorkflow { draft with Description = v })))
                 ]
             ]
+            Html.section [
+                prop.className "card stack"
+                prop.children [
+                    Html.h3 "📍 Where it lives"
+                    field
+                        "Group"
+                        (select
+                            (string draft.GroupId)
+                            [ "0", "Choose a group…"
+                              for g in m.Groups |> List.filter (fun g -> g.IsMember) do
+                                  string g.Id, g.Name ]
+                            (fun v -> dispatch (EditWorkflow { draft with GroupId = int v })))
+                    Html.p [
+                        prop.className "muted small"
+                        prop.text "The workflow appears as a post in this group, and its members can start it."
+                    ]
+                    field
+                        "Instructions (optional)"
+                        (Html.textarea [
+                            prop.className "input"
+                            prop.placeholder "Anything people should know before they start it"
+                            prop.value draft.Instructions
+                            prop.onChange (fun (v: string) -> dispatch (EditWorkflow { draft with Instructions = v }))
+                        ])
+                    field
+                        "Who can see the results"
+                        (select
+                            (match draft.ResultsVisibility with
+                             | GroupMembers -> "group"
+                             | OwnerOnly -> "owner")
+                            [ "group", "Everyone in the group"; "owner", "Only me" ]
+                            (fun v ->
+                                dispatch (EditWorkflow { draft with ResultsVisibility = if v = "owner" then OwnerOnly else GroupMembers })))
+                ]
+            ]
             triggerEditor m draft dispatch
             for i, step in List.indexed draft.Steps do
                 stepEditor m draft i step dispatch
@@ -388,6 +421,13 @@ let editorPage (m: AppModel) dispatch =
                                 ]
                         ]
                     ]
+                ]
+            ]
+            Html.section [
+                prop.className "card how-to-run"
+                prop.children [
+                    Html.h3 "How people will run it"
+                    Html.p (Workflow.howToRun (groupName m) true draft.Trigger draft.Steps)
                 ]
             ]
             match validation with
@@ -417,7 +457,6 @@ let private tabs (m: AppModel) (current: WorkflowTab) dispatch =
 
 let private workflowCard (m: AppModel) (w: Workflow) dispatch =
     let mine = w.Owner.Id = m.Me.Id
-    let canRun = w.Trigger = Manual && (w.Enabled || mine)
 
     Html.article [
         prop.key w.Id
@@ -439,18 +478,20 @@ let private workflowCard (m: AppModel) (w: Workflow) dispatch =
             Html.p [
                 prop.className "muted small"
                 prop.text (
-                    (w.Steps |> List.map (stepInfo >> snd) |> String.concat " → ")
-                    + (if mine then "" else " · by " + w.Owner.DisplayName)
+                    sprintf "In %s · %s%s" w.GroupName
+                        (w.Steps |> List.map (stepInfo >> snd) |> String.concat " → ")
+                        (if mine then "" else " · by " + w.Owner.DisplayName)
                 )
             ]
             Html.div [
                 prop.className "row workflow-actions"
                 prop.children [
-                    if canRun then
-                        button "btn btn-primary" "Run" (fun () -> dispatch (RunWorkflow w.Id))
+                    if canStart m w then
+                        button "btn btn-primary" "Start workflow" (fun () -> dispatch (RunWorkflow w.Id))
+                    if canSeeResults m w then
+                        button "btn" "Results" (fun () -> dispatch (Navigate(WorkflowResultsPage w.Id)))
                     if mine then
                         button "btn" "Edit" (fun () -> dispatch (OpenWorkflowEditor w))
-                        button "btn" "History" (fun () -> dispatch (Navigate(WorkflowHistory w)))
                         button "btn" (if w.Enabled then "Turn off" else "Turn on") (fun () -> dispatch (SetWorkflowEnabled(w.Id, not w.Enabled)))
                         Html.button [
                             prop.type'.button
@@ -555,44 +596,251 @@ let private statusPill (status: RunStatus) =
 
     Html.span [ prop.className className; prop.text text ]
 
-let historyPage (m: AppModel) (w: Workflow) dispatch =
-    Html.div [
+let private statusText (status: RunStatus) =
+    match status with
+    | Running -> "Running"
+    | WaitingForInput u -> "Waiting for " + u.DisplayName
+    | WaitingForApproval u -> "Awaiting approval from " + u.DisplayName
+    | Completed -> "Completed"
+    | Stopped reason -> "Stopped: " + reason
+    | Failed error -> "Failed: " + error
+
+[<Emit("(() => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([$1], { type: 'text/csv;charset=utf-8' })); a.download = $0; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000) })()")>]
+let private download (_fileName: string) (_contents: string) : unit = jsNative
+
+/// Quotes a CSV cell, and defuses text a spreadsheet would run as a formula.
+let private csvCell (value: string) =
+    let value = if value.Length > 0 && "=+-@".Contains(string value[0]) then "'" + value else value
+    "\"" + value.Replace("\"", "\"\"") + "\""
+
+let private starter (run: WorkflowRun) =
+    run.TriggeredBy |> Option.map (fun u -> u.DisplayName) |> Option.defaultValue "Schedule"
+
+let private resultsCsv (results: WorkflowResults) =
+    let columns = Workflow.resultColumns results.Workflow.Trigger results.Workflow.Steps
+
+    [ [ "Run"; "Started by"; "Started"; "Status" ] @ (columns |> List.map snd)
+      for run in results.Runs do
+          [ string run.Id; starter run; formatDateTime run.StartedAt; statusText run.Status ]
+          @ (columns |> List.map (fun (key, _) -> run.Values |> Map.tryFind key |> Option.defaultValue "")) ]
+    |> List.map (List.map csvCell >> String.concat ",")
+    |> String.concat "\r\n"
+
+let private stat (label: string) (value: int) =
+    Html.div [ prop.className "stat"; prop.children [ Html.strong (string value); Html.span label ] ]
+
+let resultsPage (m: AppModel) (workflowId: int) dispatch =
+    match m.Results with
+    | Some results when results.Workflow.Id = workflowId ->
+        let w = results.Workflow
+        let columns = Workflow.resultColumns w.Trigger w.Steps
+        let count f = results.Runs |> List.filter (fun r -> f r.Status) |> List.length
+
         Html.div [
-            prop.className "row spread page-title"
-            prop.children [
-                Html.h2 (w.Name + " · history")
-                button "btn" "Back" (fun () -> dispatch (Navigate(WorkflowsPage AllWorkflows)))
-            ]
-        ]
-        if m.Runs.IsEmpty then
-            Html.p [ prop.className "empty"; prop.text "This workflow hasn't run yet." ]
-        for run in m.Runs do
-            Html.article [
-                prop.key run.Id
-                prop.className "card stack"
+            Html.div [
+                prop.className "row spread page-title"
                 prop.children [
+                    Html.h2 (w.Name + " · results")
                     Html.div [
-                        prop.className "row spread"
+                        prop.className "row"
                         prop.children [
-                            Html.strong (
-                                sprintf "Run #%d · %s" run.Id
-                                    (match run.TriggeredBy with
-                                     | Some u -> u.DisplayName
-                                     | None -> "Schedule")
-                            )
-                            statusPill run.Status
-                        ]
-                    ]
-                    Html.ol [
-                        prop.className "run-log"
-                        prop.children [
-                            for entry in run.Log do
-                                Html.li [
-                                    Html.span [ prop.className "muted small"; prop.text (formatDateTime entry.At) ]
-                                    Html.span entry.Text
-                                ]
+                            button "btn" "Back" (fun () -> dispatch (Navigate(Feed(GroupFeed w.GroupId))))
+                            if results.CanEdit then
+                                button "btn" "Edit" (fun () -> dispatch (OpenWorkflowEditor w))
+                            Html.button [
+                                prop.type'.button
+                                prop.className "btn"
+                                prop.disabled results.Runs.IsEmpty
+                                prop.text "Download CSV"
+                                prop.onClick (fun _ -> download (Workflow.fieldKey w.Name + "-results.csv") (resultsCsv results))
+                            ]
                         ]
                     ]
                 ]
             ]
+            Html.section [
+                prop.className "card stack"
+                prop.children [
+                    Html.p [ prop.className "muted small"; prop.text (sprintf "In %s · by %s" w.GroupName w.Owner.DisplayName) ]
+                    if w.Description <> "" then
+                        Html.p w.Description
+                    Html.div [
+                        prop.className "how-to-run"
+                        prop.children [
+                            Html.strong "How to run it"
+                            Html.p (Workflow.howToRun (groupName m) w.Enabled w.Trigger w.Steps)
+                            if w.Instructions <> "" then
+                                Html.p [ prop.className "instructions"; prop.text w.Instructions ]
+                        ]
+                    ]
+                    if canStart m w then
+                        Html.div [ button "btn btn-primary" "Start workflow" (fun () -> dispatch (RunWorkflow w.Id)) ]
+                    if w.ResultsVisibility = OwnerOnly then
+                        Html.p [ prop.className "muted small"; prop.text "🔒 Only the owner can see these results." ]
+                ]
+            ]
+            Html.div [
+                prop.className "stats"
+                prop.children [
+                    stat "Runs" results.Runs.Length
+                    stat "Completed" (count (fun s -> s = Completed))
+                    stat
+                        "In progress"
+                        (count (function
+                            | Running
+                            | WaitingForInput _
+                            | WaitingForApproval _ -> true
+                            | _ -> false))
+                    stat
+                        "Stopped"
+                        (count (function
+                            | Stopped _
+                            | Failed _ -> true
+                            | _ -> false))
+                ]
+            ]
+            if results.Runs.IsEmpty then
+                Html.p [ prop.className "empty"; prop.text "No results yet. They'll appear here after the first run." ]
+            else
+                Html.div [
+                    prop.className "card results-table-wrap"
+                    prop.children [
+                        Html.table [
+                            prop.className "results-table"
+                            prop.children [
+                                Html.thead [
+                                    Html.tr [
+                                        Html.th "Started by"
+                                        Html.th "Started"
+                                        Html.th "Status"
+                                        for _, heading in columns do
+                                            Html.th heading
+                                    ]
+                                ]
+                                Html.tbody [
+                                    for run in results.Runs do
+                                        Html.tr [
+                                            prop.key run.Id
+                                            prop.children [
+                                                Html.td (starter run)
+                                                Html.td [ prop.className "nowrap"; prop.text (formatDateTime run.StartedAt) ]
+                                                Html.td [ statusPill run.Status ]
+                                                for key, _ in columns do
+                                                    Html.td (run.Values |> Map.tryFind key |> Option.defaultValue "")
+                                            ]
+                                        ]
+                                ]
+                            ]
+                        ]
+                    ]
+                ]
+
+                Html.section [
+                    prop.className "card stack"
+                    prop.children [
+                        Html.h3 "Step by step"
+                        for run in results.Runs do
+                            Html.details [
+                                prop.key run.Id
+                                prop.className "run-details"
+                                prop.children [
+                                    Html.summary (
+                                        sprintf "Run #%d · %s · %s · %s" run.Id (starter run) (formatDateTime run.StartedAt) (statusText run.Status)
+                                    )
+                                    Html.ol [
+                                        prop.className "run-log"
+                                        prop.children [
+                                            for entry in run.Log do
+                                                Html.li [
+                                                    Html.span [ prop.className "muted small"; prop.text (formatDateTime entry.At) ]
+                                                    Html.span entry.Text
+                                                ]
+                                        ]
+                                    ]
+                                ]
+                            ]
+                    ]
+                ]
+        ]
+    | _ -> Html.p [ prop.className "empty"; prop.text "Loading results…" ]
+
+// ---- In group feeds ----------------------------------------------------------------
+
+/// The body of a workflow's post: what it does, how to run it, and buttons to start it or see results.
+let postCard (card: WorkflowCard) dispatch =
+    Html.div [
+        prop.className "workflow-post"
+        prop.children [
+            Html.div [
+                prop.className "row spread"
+                prop.children [
+                    Html.span [ prop.className "workflow-label"; prop.text "⚡ Workflow" ]
+                    if not card.Enabled then
+                        Html.span [ prop.className "pill"; prop.text "Off" ]
+                ]
+            ]
+            Html.h3 card.Name
+            if card.Description <> "" then
+                Html.p card.Description
+            Html.div [
+                prop.className "how-to-run"
+                prop.children [
+                    Html.strong "How to run it"
+                    Html.p card.HowToRun
+                    if card.Instructions <> "" then
+                        Html.p [ prop.className "instructions"; prop.text card.Instructions ]
+                ]
+            ]
+            Html.div [
+                prop.className "row workflow-actions"
+                prop.children [
+                    if card.CanStart then
+                        button "btn btn-primary" "Start workflow" (fun () -> dispatch (RunWorkflow card.WorkflowId))
+                    elif card.IsManual && card.Enabled then
+                        Html.span [ prop.className "muted small"; prop.text "Join this group to start it." ]
+                    if card.CanSeeResults then
+                        button
+                            "btn"
+                            (match card.RunCount with
+                             | 0 -> "Results"
+                             | 1 -> "Results (1 run)"
+                             | n -> sprintf "Results (%d runs)" n)
+                            (fun () -> dispatch (Navigate(WorkflowResultsPage card.WorkflowId)))
+                ]
+            ]
+        ]
     ]
+
+/// A compact list of a group's workflows for the top of its feed.
+let groupWorkflows (m: AppModel) (groupId: int) dispatch =
+    let workflows = m.Workflows |> List.filter (fun w -> w.GroupId = groupId)
+
+    if workflows.IsEmpty then
+        Html.none
+    else
+        Html.div [
+            prop.className "group-workflows"
+            prop.children [
+                Html.span [ prop.className "muted small"; prop.text "⚡ Workflows in this group" ]
+                for w in workflows do
+                    Html.div [
+                        prop.key w.Id
+                        prop.className "row spread group-workflow"
+                        prop.children [
+                            Html.div [
+                                Html.strong w.Name
+                                Html.div [ prop.className "muted small"; prop.text (describeTrigger m w.Trigger) ]
+                            ]
+                            Html.div [
+                                prop.className "row"
+                                prop.children [
+                                    if canStart m w then
+                                        button "btn btn-primary" "Start" (fun () -> dispatch (RunWorkflow w.Id))
+                                    if canSeeResults m w then
+                                        button "btn" "Results" (fun () -> dispatch (Navigate(WorkflowResultsPage w.Id)))
+                                ]
+                            ]
+                        ]
+                    ]
+            ]
+        ]

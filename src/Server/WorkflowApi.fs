@@ -60,6 +60,46 @@ let private toTask (run: RunRow) : PendingTask option =
           Kind = kind
           CreatedAt = run.Log |> List.tryLast |> Option.map (fun e -> e.At) |> Option.defaultValue run.CreatedAt })
 
+let private groupNameLookup (db: Db.Store) id =
+    db.GetGroup(0, id) |> Option.map (fun g -> g.Name) |> Option.defaultValue "a deleted group"
+
+let private isOwner (me: User) (w: Workflow) = w.Owner.Id = me.Id
+
+/// Manual workflows can be started by their owner (even while off, to test) and by members of their group.
+let canStart (db: Db.Store) (me: User) (w: Workflow) =
+    w.Trigger = Manual && (isOwner me w || (w.Enabled && db.IsMember(me.Id, w.GroupId)))
+
+let canSeeResults (db: Db.Store) (me: User) (w: Workflow) =
+    isOwner me w || (w.ResultsVisibility = GroupMembers && db.IsMember(me.Id, w.GroupId))
+
+let private card (db: Db.Store) (me: User) (runCount: int) (w: Workflow) : WorkflowCard =
+    { WorkflowId = w.Id
+      Name = w.Name
+      Description = w.Description
+      HowToRun = Workflow.howToRun (groupNameLookup db) w.Enabled w.Trigger w.Steps
+      Instructions = w.Instructions
+      Enabled = w.Enabled
+      IsManual = w.Trigger = Manual
+      RunCount = runCount
+      CanStart = canStart db me w
+      CanSeeResults = canSeeResults db me w
+      CanEdit = isOwner me w }
+
+/// Adds the workflow card to posts that are a workflow's home in its group.
+let decoratePosts (db: Db.Store) (store: WorkflowStore) (me: User) (posts: Post list) : Post list =
+    let workflows = store.ForPosts(posts |> List.map (fun p -> p.Id))
+
+    if workflows.IsEmpty then
+        posts
+    else
+        let counts = store.RunCounts(workflows |> Map.toList |> List.map (fun (_, w) -> w.Id))
+
+        posts
+        |> List.map (fun p ->
+            match workflows.TryFind p.Id with
+            | Some w -> { p with Workflow = Some(card db me (counts.TryFind w.Id |> Option.defaultValue 0) w) }
+            | None -> p)
+
 let create (db: Db.Store) (store: WorkflowStore) (engine: Engine) (me: User) : IWorkflowApi =
     let owned id =
         match store.Get id with
@@ -74,9 +114,16 @@ let create (db: Db.Store) (store: WorkflowStore) (engine: Engine) (me: User) : I
             async {
                 let ownership = if draft.Id = 0 then Ok() else owned draft.Id |> Result.map ignore
 
+                let membership () =
+                    if draft.GroupId <= 0 || db.IsMember(me.Id, draft.GroupId) then
+                        Ok()
+                    else
+                        Error "Join the group before adding a workflow to it"
+
                 return
                     ownership
                     |> Result.bind (fun () -> Workflow.validate draft)
+                    |> Result.bind membership
                     |> Result.bind (fun () -> checkReferences db me draft)
                     |> Result.map (fun () -> store.Save(me.Id, draft) |> store.Get |> Option.get)
             }
@@ -98,16 +145,29 @@ let create (db: Db.Store) (store: WorkflowStore) (engine: Engine) (me: User) : I
             async {
                 match store.Get id with
                 | None -> return Error "That workflow no longer exists"
-                | Some w when w.Trigger <> Manual -> return Error "This workflow starts automatically and can't be run by hand"
-                // The owner may test a workflow before turning it on.
-                | Some w when not w.Enabled && w.Owner.Id <> me.Id -> return Error "This workflow is turned off"
+                | Some w when w.Trigger <> Manual -> return Error "This workflow starts by itself and can't be started by hand"
+                | Some w when not (canStart db me w) && not w.Enabled -> return Error "This workflow is turned off"
+                | Some w when not (canStart db me w) -> return Error(sprintf "Join %s to start this workflow" w.GroupName)
                 | Some w ->
                     let! run = engine.Start(w, Some me, Map.empty)
                     return Ok run
             }
 
-      getRuns =
-        fun id -> async { return owned id |> Result.map (fun w -> store.RunsFor w.Id |> List.map toApiRun) }
+      getResults =
+        fun id ->
+            async {
+                return
+                    match store.Get id with
+                    | None -> Error "That workflow no longer exists"
+                    | Some w when not (canSeeResults db me w) && w.ResultsVisibility = OwnerOnly ->
+                        Error "Only the workflow's owner can see its results"
+                    | Some w when not (canSeeResults db me w) -> Error(sprintf "Join %s to see this workflow's results" w.GroupName)
+                    | Some w ->
+                        Ok
+                            { Workflow = w
+                              Runs = store.RunsFor w.Id |> List.map toApiRun
+                              CanEdit = isOwner me w }
+            }
 
       getTasks = fun () -> async { return store.WaitingOn me.Id |> List.choose toTask }
 

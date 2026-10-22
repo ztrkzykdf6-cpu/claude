@@ -104,6 +104,16 @@ let execute conn sql ps =
     use cmd = command conn sql ps
     cmd.ExecuteNonQuery()
 
+/// Adds a column to an existing table if an older database doesn't have it yet.
+let addColumnIfMissing (conn: SqliteConnection) (table: string) (column: string) (definition: string) =
+    let exists =
+        query conn $"SELECT 1 FROM pragma_table_info('{table}') WHERE name = @c" [ "@c", box column ] ignore
+        |> List.isEmpty
+        |> not
+
+    if not exists then
+        execute conn $"ALTER TABLE {table} ADD COLUMN {column} {definition}" [] |> ignore
+
 let insert conn sql ps =
     use cmd = command conn (sql + "; SELECT last_insert_rowid();") ps
     cmd.ExecuteScalar() :?> int64 |> int
@@ -327,7 +337,8 @@ type Store(connectionString: string) =
                       LikeCount = r.GetInt32 5
                       LikedByMe = r.GetInt32 6 = 1
                       Author = readUserAt r 7
-                      Comments = [] })
+                      Comments = []
+                      Workflow = None })
 
         if posts.IsEmpty then
             []

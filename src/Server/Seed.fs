@@ -58,14 +58,27 @@ let run (db: Store) (workflows: WorkflowDb.WorkflowStore) =
         db.SendMessage(id "alex", id "sam", "Can you look at the deploy checklist before tomorrow?") |> ignore
         db.SendMessage(id "sam", id "alex", "On it, I'll send comments by noon.") |> ignore
 
-        let workflow owner name description trigger steps =
-            workflows.Save(id owner, { Id = 0; Name = name; Description = description; Trigger = trigger; Steps = steps })
+        let workflow owner group name description instructions visibility trigger steps =
+            workflows.Save(
+                id owner,
+                { Id = 0
+                  GroupId = group
+                  Name = name
+                  Description = description
+                  Instructions = instructions
+                  ResultsVisibility = visibility
+                  Trigger = trigger
+                  Steps = steps }
+            )
             |> ignore
 
         workflow
             "mei"
+            everyone
             "Request time off"
             "Ask for time off; your manager approves it."
+            "Request at least two weeks ahead for vacations. For sick leave, request on the day."
+            OwnerOnly
             Manual
             [ CollectInput(
                   TriggeringUser,
@@ -82,14 +95,20 @@ let run (db: Store) (workflows: WorkflowDb.WorkflowStore) =
 
         workflow
             "alex"
+            eng
             "Incident alert"
             "Messages the engineering manager when an Engineering post mentions an incident."
+            "Mention \"incident\" in your post and include what's affected."
+            GroupMembers
             (NewGroupPost(eng, "incident"))
             [ SendMessage(SpecificUser(id "alex"), "{{trigger.user}} posted about an incident in {{trigger.group}}:\n{{trigger.post}}") ]
 
         workflow
             "mei"
+            everyone
             "Monday kickoff"
             "Posts a weekly prompt in Company Announcements."
+            ""
+            GroupMembers
             (Scheduled { Days = [ 1 ]; Hour = 9; Minute = 0; TimeZone = "UTC" })
             [ PostToGroup(everyone, "Happy Monday! What's your top priority this week? Share it in the comments.") ]
