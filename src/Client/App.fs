@@ -5,5 +5,5 @@ open Elmish.React
 
 Program.mkProgram State.init State.update View.view
 |> Program.withSubscription State.subscribe
-|> Program.withReactBatched "root"
+|> Program.withReactSynchronous "root"
 |> Program.run
