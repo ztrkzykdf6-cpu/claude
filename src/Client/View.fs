@@ -484,9 +484,11 @@ let private chatPage (m: AppModel) (partner: User option) dispatch =
                         Html.button [
                             prop.key c.Partner.Id
                             prop.type'.button
-                            prop.className (
-                                if partner |> Option.exists (fun p -> p.Id = c.Partner.Id) then "chat-item active" else "chat-item"
-                            )
+                            prop.className [
+                                "chat-item"
+                                if partner |> Option.exists (fun p -> p.Id = c.Partner.Id) then "active"
+                                if m.Unread.Contains c.Partner.Id then "unread"
+                            ]
                             prop.onClick (fun _ -> dispatch (Navigate(Chat(Some c.Partner))))
                             prop.children [
                                 avatar "md" c.Partner
@@ -558,12 +560,17 @@ let private chatPage (m: AppModel) (partner: User option) dispatch =
 
 // ---- Shell ----------------------------------------------------------------------
 
-let private navItem (icon: string) (label: string) (page: Page) (isActive: bool) dispatch =
+let private navItem (icon: string) (label: string) (page: Page) (isActive: bool) (badge: int) dispatch =
     Html.button [
         prop.type'.button
         prop.className (if isActive then "nav-item active" else "nav-item")
         prop.onClick (fun _ -> dispatch (Navigate page))
-        prop.children [ Html.span [ prop.className "nav-icon"; prop.text icon ]; Html.span label ]
+        prop.children [
+            Html.span [ prop.className "nav-icon"; prop.text icon ]
+            Html.span label
+            if badge > 0 then
+                Html.span [ prop.className "badge"; prop.title "Unread chats"; prop.text (string badge) ]
+        ]
     ]
 
 let private appView (m: AppModel) dispatch =
@@ -599,10 +606,10 @@ let private appView (m: AppModel) dispatch =
                     Html.nav [
                         prop.className "sidebar"
                         prop.children [
-                            navItem "🏠" "Home" (Feed HomeFeed) (m.Page = Feed HomeFeed) dispatch
-                            navItem "👥" "Groups" Groups (m.Page = Groups) dispatch
-                            navItem "💬" "Chat" (Chat None) (match m.Page with Chat _ -> true | _ -> false) dispatch
-                            navItem "📇" "People" People (m.Page = People) dispatch
+                            navItem "🏠" "Home" (Feed HomeFeed) (m.Page = Feed HomeFeed) 0 dispatch
+                            navItem "👥" "Groups" Groups (m.Page = Groups) 0 dispatch
+                            navItem "💬" "Chat" (Chat None) (match m.Page with Chat _ -> true | _ -> false) m.Unread.Count dispatch
+                            navItem "📇" "People" People (m.Page = People) 0 dispatch
                             Html.h4 [ prop.className "sidebar-heading"; prop.text "Your groups" ]
                             for g in m.Groups |> List.filter (fun g -> g.IsMember) do
                                 Html.button [

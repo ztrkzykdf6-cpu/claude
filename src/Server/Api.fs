@@ -51,7 +51,8 @@ let auth (db: Store) : IAuthApi =
             } }
 
 /// The API as seen by one signed-in user; built per request from the authenticated session.
-let workplace (db: Store) (me: User) (token: string) : IWorkplaceApi =
+/// `notify` pushes a newly sent chat message to the participants' live connections.
+let workplace (db: Store) (notify: ChatMessage -> Async<unit>) (me: User) (token: string) : IWorkplaceApi =
     let post postId =
         match db.GetPost(me.Id, postId) with
         | Some p -> p
@@ -161,15 +162,16 @@ let workplace (db: Store) (me: User) (token: string) : IWorkplaceApi =
             async {
                 let body = body.Trim()
 
-                return
-                    if body = "" then
-                        Error "Message is empty"
-                    elif body.Length > Validation.maxMessageLength then
-                        Error $"Messages are limited to {Validation.maxMessageLength} characters"
-                    elif recipientId = me.Id then
-                        Error "You can't message yourself"
-                    elif (db.GetUser recipientId).IsNone then
-                        Error "That person no longer exists"
-                    else
-                        Ok(db.SendMessage(me.Id, recipientId, body))
+                if body = "" then
+                    return Error "Message is empty"
+                elif body.Length > Validation.maxMessageLength then
+                    return Error $"Messages are limited to {Validation.maxMessageLength} characters"
+                elif recipientId = me.Id then
+                    return Error "You can't message yourself"
+                elif (db.GetUser recipientId).IsNone then
+                    return Error "That person no longer exists"
+                else
+                    let message = db.SendMessage(me.Id, recipientId, body)
+                    do! notify message
+                    return Ok message
             } }

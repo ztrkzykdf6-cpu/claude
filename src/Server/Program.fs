@@ -4,6 +4,7 @@ open System
 open System.IO
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Http
+open Microsoft.AspNetCore.SignalR
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging
@@ -36,7 +37,7 @@ let private requireUser (db: Db.Store) : HttpHandler =
             next ctx
         | None -> RequestErrors.UNAUTHORIZED "Bearer" "workplace" "Sign in required" next ctx
 
-let private webApp (db: Db.Store) (logger: ILogger) : HttpHandler =
+let private webApp (db: Db.Store) (hub: IHubContext<Realtime.ChatHub>) (logger: ILogger) : HttpHandler =
     let authApi =
         Remoting.createApi ()
         |> Remoting.withRouteBuilder Route.builder
@@ -48,7 +49,7 @@ let private webApp (db: Db.Store) (logger: ILogger) : HttpHandler =
         Remoting.createApi ()
         |> Remoting.withRouteBuilder Route.builder
         |> Remoting.fromContext (fun (ctx: HttpContext) ->
-            Api.workplace db (ctx.Items[userKey] :?> User) (ctx.Items[tokenKey] :?> string))
+            Api.workplace db (Realtime.notifyMessage hub) (ctx.Items[userKey] :?> User) (ctx.Items[tokenKey] :?> string))
         |> Remoting.withErrorHandler (errorHandler logger)
         |> Remoting.buildHttpHandler
 
@@ -61,6 +62,7 @@ let private webApp (db: Db.Store) (logger: ILogger) : HttpHandler =
 let main args =
     let builder = WebApplication.CreateBuilder(args)
     builder.Services.AddGiraffe() |> ignore
+    builder.Services.AddSignalR() |> ignore
 
     let dbPath = builder.Configuration["Database:Path"] |> Option.ofObj |> Option.defaultValue "workplace.db"
     Path.GetDirectoryName(Path.GetFullPath dbPath) |> Directory.CreateDirectory |> ignore
@@ -71,11 +73,16 @@ let main args =
     if builder.Configuration.GetValue<bool>("Database:Seed", true) then
         Seed.run db
 
+    builder.Services.AddSingleton<Db.Store>(db) |> ignore
+
     let app = builder.Build()
     let logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Workplace")
 
     // The production client build is copied into wwwroot; in development Vite serves it instead.
     app.UseDefaultFiles().UseStaticFiles() |> ignore
-    app.UseGiraffe(webApp db logger)
+    let hub = app.Services.GetRequiredService<IHubContext<Realtime.ChatHub>>()
+    // Giraffe passes unmatched requests on, so /hubs/chat reaches the endpoint below.
+    app.UseGiraffe(webApp db hub logger)
+    app.MapHub<Realtime.ChatHub>("/hubs/chat") |> ignore
     app.Run()
     0

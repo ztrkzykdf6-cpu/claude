@@ -217,6 +217,16 @@ textarea.input { resize: vertical; min-height: 80px; }
 .nav-item.active { background: var(--primary-soft); color: var(--primary); }
 .nav-item.small { font-weight: 500; padding: 8px 10px; }
 .nav-icon { font-size: 20px; width: 24px; text-align: center; }
+.badge {
+  margin-left: auto;
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 12px;
+  text-align: center;
+}
 
 .page-title { font-size: 22px; margin-bottom: 16px; }
 
@@ -305,6 +315,7 @@ textarea.input { resize: vertical; min-height: 80px; }
 .chat-item:hover { background: var(--surface-alt); }
 .chat-item.active { background: var(--primary-soft); }
 .chat-item-text { display: flex; flex-direction: column; min-width: 0; }
+.chat-item.unread .chat-item-text span { color: var(--text); font-weight: 600; }
 
 .chat-thread { display: flex; flex-direction: column; min-height: 0; }
 .chat-thread.empty { align-items: center; justify-content: center; color: var(--muted); }

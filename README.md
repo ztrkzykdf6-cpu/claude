@@ -4,7 +4,7 @@ A team collaboration app in the style of Workplace from Meta, written end to end
 
 - **Home feed**: post updates, like posts and comment on them
 - **Groups**: create, join and leave groups, each with its own feed
-- **Chat**: one-to-one messages, refreshed every few seconds while a chat is open
+- **Chat**: one-to-one messages delivered instantly over SignalR, with an unread badge for other chats
 - **People**: a searchable company directory with editable profiles
 - **Accounts**: registration and sign-in with PBKDF2-hashed passwords and bearer session tokens
 
@@ -12,15 +12,15 @@ A team collaboration app in the style of Workplace from Meta, written end to end
 
 | Layer | Tech |
 | --- | --- |
-| Server | ASP.NET Core + Giraffe, SQLite (`Microsoft.Data.Sqlite`) |
+| Server | ASP.NET Core + Giraffe, SQLite (`Microsoft.Data.Sqlite`), SignalR for live chat |
 | API | [Fable.Remoting](https://github.com/Zaid-Ajaj/Fable.Remoting): type-safe calls declared once in `src/Shared` |
 | Client | [Fable](https://fable.io) 4 → JavaScript, Elmish (MVU), Feliz (React 18), Vite |
 
 ```
 src/
   Shared/   Domain types and the API contract used by both sides
-  Server/   Db.fs (SQLite), Auth.fs (passwords and tokens), Api.fs, Seed.fs, Program.fs
-  Client/   Api.fs (proxies), State.fs (Elmish model/update), View.fs (Feliz), styles.css
+  Server/   Db.fs (SQLite), Auth.fs (passwords and tokens), Realtime.fs (SignalR hub), Api.fs, Seed.fs, Program.fs
+  Client/   Api.fs (proxies), Realtime.fs (SignalR connection), State.fs (Elmish model/update), View.fs (Feliz), styles.css
 ```
 
 ## Prerequisites
@@ -39,7 +39,7 @@ Run the server and the client in two terminals:
 
 ```bash
 dotnet watch run --project src/Server   # API on http://localhost:5000
-npm start                               # Fable + Vite on http://localhost:8080; proxies /api to the server
+npm start                               # Fable + Vite on http://localhost:8080; proxies /api and /hubs to the server
 ```
 
 Open http://localhost:8080. On first run the database is seeded with demo data. You can sign in as
@@ -67,5 +67,9 @@ Turn off seeding (`Database__Seed=false`) for a real deployment, because the dem
 ## Notes
 
 - Groups are open: anyone can read a group's feed, and only members can post in it.
-- Chat uses polling, not WebSockets. SignalR would be the next step for instant delivery.
+- Messages are sent through the regular API and pushed to both people over the `/hubs/chat` SignalR hub. The
+  hub authenticates with the session token in the `access_token` query string, because browsers can't set headers
+  on WebSockets. After a dropped connection, the client reconnects and fetches anything it missed.
+- The hub runs in-process, so live delivery reaches only clients connected to the same server instance. Scaling
+  out to several instances needs a SignalR backplane (such as Redis) or Azure SignalR Service.
 - The client stays on Fable 4 because Fable.Remoting's JSON decoder doesn't yet handle Fable 5's reflection info for lists and options.

@@ -28,6 +28,7 @@ type AuthModel =
 
 type AppModel =
     { Api: IWorkplaceApi
+      Token: string
       Me: User
       Page: Page
       Posts: Post list
@@ -41,6 +42,8 @@ type AppModel =
       Conversations: Conversation list
       Messages: ChatMessage list
       MessageDraft: string
+      /// Chat partners with messages that arrived while their thread wasn't open.
+      Unread: Set<int>
       ProfileDraft: ProfileUpdate option
       Notice: string option }
 
@@ -58,7 +61,7 @@ type AuthField =
 
 type Msg =
     // Session
-    | SessionRestored of IWorkplaceApi * User
+    | SessionRestored of token: string * User
     | SessionInvalid
     | SetAuthMode of AuthMode
     | SetAuthField of AuthField * string
@@ -100,7 +103,8 @@ type Msg =
     // Chat
     | ConversationsLoaded of Conversation list
     | MessagesLoaded of partnerId: int * ChatMessage list
-    | PollChat
+    | MessageReceived of ChatMessage
+    | CatchUpChat
     | SetMessageDraft of string
     | SendMessage
     | MessageSent of Result<ChatMessage, string>
@@ -115,8 +119,9 @@ let private emptyAuth =
       Busy = false
       Error = None }
 
-let private appModel api me =
-    { Api = api
+let private appModel token me =
+    { Api = Api.workplace token
+      Token = token
       Me = me
       Page = Feed HomeFeed
       Posts = []
@@ -130,6 +135,7 @@ let private appModel api me =
       Conversations = []
       Messages = []
       MessageDraft = ""
+      Unread = Set.empty
       ProfileDraft = None
       Notice = None }
 
@@ -146,11 +152,11 @@ let init () : Model * Cmd<Msg> =
     match Api.TokenStore.load () with
     | Some token ->
         let api = Api.workplace token
-        Starting, Cmd.OfAsync.either api.me () (fun me -> SessionRestored(api, me)) (fun _ -> SessionInvalid)
+        Starting, Cmd.OfAsync.either api.me () (fun me -> SessionRestored(token, me)) (fun _ -> SessionInvalid)
     | None -> Auth emptyAuth, Cmd.none
 
-let private startApp api me =
-    let m = appModel api me
+let private startApp token me =
+    let m = appModel token me
     App m, Cmd.batch [ loadFeed m HomeFeed; loadGroups m ]
 
 let private replacePost (post: Post) (posts: Post list) =
@@ -162,6 +168,15 @@ let private replaceGroup (group: Group) (groups: Group list) =
     else
         groups @ [ group ] |> List.sortBy (fun g -> g.Name.ToLowerInvariant())
 
+/// Adds messages to the open thread if it is the one with `partnerId`, skipping any already shown.
+let private appendMessages partnerId (incoming: ChatMessage list) (m: AppModel) =
+    match m.Page with
+    | Chat(Some partner) when partner.Id = partnerId ->
+        let known = m.Messages |> List.map (fun x -> x.Id) |> Set.ofList
+        let fresh = incoming |> List.filter (fun x -> not (known.Contains x.Id))
+        { m with Messages = m.Messages @ fresh |> List.sortBy (fun x -> x.Id) }
+    | _ -> m
+
 let private notice text m = { m with Notice = Some text }, Cmd.none
 
 let private navigate page (m: AppModel) =
@@ -172,7 +187,12 @@ let private navigate page (m: AppModel) =
     | Groups -> m, loadGroups m
     | People -> m, call m.Api.getPeople m.PeopleSearch (fun people -> PeopleLoaded(m.PeopleSearch, people))
     | Chat partner ->
-        let m = { m with Messages = []; MessageDraft = "" }
+        let unread =
+            match partner with
+            | Some p -> m.Unread.Remove p.Id
+            | None -> m.Unread
+
+        let m = { m with Messages = []; MessageDraft = ""; Unread = unread }
         let thread = partner |> Option.map (fun p -> loadMessages m p 0) |> Option.defaultValue Cmd.none
         m, Cmd.batch [ loadConversations m; thread ]
     | Profile _ -> m, Cmd.none
@@ -205,7 +225,7 @@ let private updateAuth msg (a: AuthModel) : Model * Cmd<Msg> =
         Auth { a with Busy = true; Error = None }, Cmd.OfAsync.either (fun () -> request) () AuthResult Failed
     | AuthResult(Ok session) ->
         Api.TokenStore.save session.Token
-        startApp (Api.workplace session.Token) session.User
+        startApp session.Token session.User
     | AuthResult(Error e) -> Auth { a with Busy = false; Error = Some e }, Cmd.none
     | Failed ex -> Auth { a with Busy = false; Error = Some(Api.errorMessage ex) }, Cmd.none
     | _ -> Auth a, Cmd.none
@@ -290,18 +310,25 @@ let private updateApp msg (m: AppModel) : Model * Cmd<Msg> =
     | ProfileSaved(Ok me) -> App { m with Me = me; ProfileDraft = None; Page = Profile me }, Cmd.none
 
     | ConversationsLoaded conversations -> App { m with Conversations = conversations }, Cmd.none
-    | MessagesLoaded(partnerId, incoming) ->
+    | MessagesLoaded(partnerId, incoming) -> App(appendMessages partnerId incoming m), Cmd.none
+    | MessageReceived message ->
+        let partnerId = if message.SenderId = m.Me.Id then message.RecipientId else message.SenderId
+
+        let m =
+            match m.Page with
+            | Chat(Some partner) when partner.Id = partnerId -> appendMessages partnerId [ message ] m
+            | _ when message.SenderId <> m.Me.Id -> { m with Unread = m.Unread.Add partnerId }
+            | _ -> m
+
         match m.Page with
-        | Chat(Some partner) when partner.Id = partnerId ->
-            let known = m.Messages |> List.map (fun x -> x.Id) |> Set.ofList
-            let fresh = incoming |> List.filter (fun x -> not (known.Contains x.Id))
-            App { m with Messages = m.Messages @ fresh |> List.sortBy (fun x -> x.Id) }, Cmd.none
+        | Chat _ -> App m, loadConversations m
         | _ -> App m, Cmd.none
-    | PollChat ->
+    | CatchUpChat ->
         match m.Page with
-        | Chat(Some partner) ->
+        | Chat partner ->
             let lastId = m.Messages |> List.tryLast |> Option.map (fun x -> x.Id) |> Option.defaultValue 0
-            App m, Cmd.batch [ loadMessages m partner lastId; loadConversations m ]
+            let thread = partner |> Option.map (fun p -> loadMessages m p lastId) |> Option.defaultValue Cmd.none
+            App m, Cmd.batch [ thread; loadConversations m ]
         | _ -> App m, Cmd.none
     | SetMessageDraft text -> App { m with MessageDraft = text }, Cmd.none
     | SendMessage ->
@@ -310,8 +337,9 @@ let private updateApp msg (m: AppModel) : Model * Cmd<Msg> =
             App { m with MessageDraft = "" },
             Cmd.OfAsync.either (fun () -> m.Api.sendMessage partner.Id m.MessageDraft) () MessageSent Failed
         | _ -> App m, Cmd.none
-    | MessageSent(Ok message) ->
-        App m, Cmd.batch [ Cmd.ofMsg (MessagesLoaded(message.RecipientId, [ message ])); loadConversations m ]
+    // The hub echoes our own messages too, but adding the message here doesn't depend on the live connection.
+    // Appending skips duplicates.
+    | MessageSent(Ok message) -> App(appendMessages message.RecipientId [ message ] m), loadConversations m
 
     | PostCreated(Error e)
     | PostDeleted(_, Error e)
@@ -324,7 +352,7 @@ let private updateApp msg (m: AppModel) : Model * Cmd<Msg> =
 
 let update (msg: Msg) (model: Model) : Model * Cmd<Msg> =
     match model, msg with
-    | Starting, SessionRestored(api, me) -> startApp api me
+    | Starting, SessionRestored(token, me) -> startApp token me
     | Starting, SessionInvalid ->
         Api.TokenStore.clear ()
         Auth emptyAuth, Cmd.none
@@ -332,14 +360,10 @@ let update (msg: Msg) (model: Model) : Model * Cmd<Msg> =
     | App m, _ -> updateApp msg m
     | Starting, _ -> model, Cmd.none
 
-/// While a chat thread is open, poll for new messages every few seconds.
+/// While signed in, keep a live connection that delivers chat messages as they're sent.
 let subscribe (model: Model) : Sub<Msg> =
     match model with
-    | App { Page = Chat(Some partner) } ->
-        [ [ "chat"; string partner.Id ],
-          fun dispatch ->
-              let id = Browser.Dom.window.setInterval ((fun () -> dispatch PollChat), 3000)
-
-              { new IDisposable with
-                  member _.Dispose() = Browser.Dom.window.clearInterval id } ]
+    | App m ->
+        [ [ "realtime"; string m.Me.Id ],
+          fun dispatch -> Realtime.connect m.Token (MessageReceived >> dispatch) (fun () -> dispatch CatchUpChat) ]
     | _ -> []

@@ -6,6 +6,7 @@
 
   <ItemGroup>
     <Compile Include="Api.fs" />
+    <Compile Include="Realtime.fs" />
     <Compile Include="State.fs" />
     <Compile Include="View.fs" />
     <Compile Include="App.fs" />

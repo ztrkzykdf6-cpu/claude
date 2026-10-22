@@ -6,7 +6,10 @@ export default defineConfig({
   root: "src/Client",
   server: {
     port: 8080,
-    proxy: { "/api": serverUrl },
+    proxy: {
+      "/api": serverUrl,
+      "/hubs": { target: serverUrl, ws: true },
+    },
     watch: { ignored: ["**/*.fs"] },
   },
   build: {
