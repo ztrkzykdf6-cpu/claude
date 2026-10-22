@@ -1,0 +1,345 @@
+/// Elmish model, messages and update logic.
+module State
+
+open System
+open Elmish
+open Shared
+
+type Page =
+    | Feed of FeedQuery
+    | Groups
+    | People
+    | Chat of partner: User option
+    | Profile of User
+
+type AuthMode =
+    | SignIn
+    | Register
+
+type AuthModel =
+    { Mode: AuthMode
+      Username: string
+      Password: string
+      DisplayName: string
+      Title: string
+      Department: string
+      Busy: bool
+      Error: string option }
+
+type AppModel =
+    { Api: IWorkplaceApi
+      Me: User
+      Page: Page
+      Posts: Post list
+      PostsLoading: bool
+      Draft: string
+      CommentDrafts: Map<int, string>
+      Groups: Group list
+      NewGroup: NewGroup
+      PeopleSearch: string
+      People: User list
+      Conversations: Conversation list
+      Messages: ChatMessage list
+      MessageDraft: string
+      ProfileDraft: ProfileUpdate option
+      Notice: string option }
+
+type Model =
+    | Starting
+    | Auth of AuthModel
+    | App of AppModel
+
+type AuthField =
+    | Username
+    | Password
+    | DisplayName
+    | Title
+    | Department
+
+type Msg =
+    // Session
+    | SessionRestored of IWorkplaceApi * User
+    | SessionInvalid
+    | SetAuthMode of AuthMode
+    | SetAuthField of AuthField * string
+    | SubmitAuth
+    | AuthResult of Result<Session, string>
+    | SignOut
+    | Failed of exn
+    | DismissNotice
+    // Navigation
+    | Navigate of Page
+    // Feed
+    | PostsLoaded of FeedQuery * Post list
+    | SetDraft of string
+    | SubmitPost
+    | PostCreated of Result<Post, string>
+    | PostUpdated of Post
+    | ToggleLike of postId: int
+    | DeletePost of postId: int
+    | PostDeleted of postId: int * Result<unit, string>
+    | SetCommentDraft of postId: int * string
+    | SubmitComment of postId: int
+    | CommentAdded of postId: int * Result<Post, string>
+    // Groups
+    | GroupsLoaded of Group list
+    | SetNewGroupName of string
+    | SetNewGroupDescription of string
+    | SubmitGroup
+    | GroupCreated of Result<Group, string>
+    | SetMembership of groupId: int * bool
+    | GroupUpdated of Group
+    // People & profile
+    | SetPeopleSearch of string
+    | PeopleLoaded of term: string * User list
+    | EditProfile
+    | SetProfileDraft of ProfileUpdate
+    | CancelProfileEdit
+    | SaveProfile
+    | ProfileSaved of Result<User, string>
+    // Chat
+    | ConversationsLoaded of Conversation list
+    | MessagesLoaded of partnerId: int * ChatMessage list
+    | PollChat
+    | SetMessageDraft of string
+    | SendMessage
+    | MessageSent of Result<ChatMessage, string>
+
+let private emptyAuth =
+    { Mode = SignIn
+      Username = ""
+      Password = ""
+      DisplayName = ""
+      Title = ""
+      Department = ""
+      Busy = false
+      Error = None }
+
+let private appModel api me =
+    { Api = api
+      Me = me
+      Page = Feed HomeFeed
+      Posts = []
+      PostsLoading = true
+      Draft = ""
+      CommentDrafts = Map.empty
+      Groups = []
+      NewGroup = { Name = ""; Description = "" }
+      PeopleSearch = ""
+      People = []
+      Conversations = []
+      Messages = []
+      MessageDraft = ""
+      ProfileDraft = None
+      Notice = None }
+
+let private call fn arg onOk = Cmd.OfAsync.either fn arg onOk Failed
+
+let private loadFeed (m: AppModel) feed = call m.Api.getFeed feed (fun posts -> PostsLoaded(feed, posts))
+let private loadGroups (m: AppModel) = call m.Api.getGroups () GroupsLoaded
+let private loadConversations (m: AppModel) = call m.Api.getConversations () ConversationsLoaded
+
+let private loadMessages (m: AppModel) (partner: User) afterId =
+    Cmd.OfAsync.either (fun () -> m.Api.getMessages partner.Id afterId) () (fun msgs -> MessagesLoaded(partner.Id, msgs)) Failed
+
+let init () : Model * Cmd<Msg> =
+    match Api.TokenStore.load () with
+    | Some token ->
+        let api = Api.workplace token
+        Starting, Cmd.OfAsync.either api.me () (fun me -> SessionRestored(api, me)) (fun _ -> SessionInvalid)
+    | None -> Auth emptyAuth, Cmd.none
+
+let private startApp api me =
+    let m = appModel api me
+    App m, Cmd.batch [ loadFeed m HomeFeed; loadGroups m ]
+
+let private replacePost (post: Post) (posts: Post list) =
+    posts |> List.map (fun p -> if p.Id = post.Id then post else p)
+
+let private replaceGroup (group: Group) (groups: Group list) =
+    if groups |> List.exists (fun g -> g.Id = group.Id) then
+        groups |> List.map (fun g -> if g.Id = group.Id then group else g)
+    else
+        groups @ [ group ] |> List.sortBy (fun g -> g.Name.ToLowerInvariant())
+
+let private notice text m = { m with Notice = Some text }, Cmd.none
+
+let private navigate page (m: AppModel) =
+    let m = { m with Page = page; Notice = None; ProfileDraft = None }
+
+    match page with
+    | Feed feed -> { m with Posts = []; PostsLoading = true }, Cmd.batch [ loadFeed m feed; loadGroups m ]
+    | Groups -> m, loadGroups m
+    | People -> m, call m.Api.getPeople m.PeopleSearch (fun people -> PeopleLoaded(m.PeopleSearch, people))
+    | Chat partner ->
+        let m = { m with Messages = []; MessageDraft = "" }
+        let thread = partner |> Option.map (fun p -> loadMessages m p 0) |> Option.defaultValue Cmd.none
+        m, Cmd.batch [ loadConversations m; thread ]
+    | Profile _ -> m, Cmd.none
+
+let private updateAuth msg (a: AuthModel) : Model * Cmd<Msg> =
+    match msg with
+    | SetAuthMode mode -> Auth { a with Mode = mode; Error = None }, Cmd.none
+    | SetAuthField(field, value) ->
+        let a =
+            match field with
+            | Username -> { a with Username = value }
+            | Password -> { a with Password = value }
+            | DisplayName -> { a with DisplayName = value }
+            | Title -> { a with Title = value }
+            | Department -> { a with Department = value }
+
+        Auth a, Cmd.none
+    | SubmitAuth when not a.Busy ->
+        let request =
+            match a.Mode with
+            | SignIn -> Api.auth.login { Username = a.Username; Password = a.Password }
+            | Register ->
+                Api.auth.register
+                    { Username = a.Username
+                      Password = a.Password
+                      DisplayName = a.DisplayName
+                      Title = a.Title
+                      Department = a.Department }
+
+        Auth { a with Busy = true; Error = None }, Cmd.OfAsync.either (fun () -> request) () AuthResult Failed
+    | AuthResult(Ok session) ->
+        Api.TokenStore.save session.Token
+        startApp (Api.workplace session.Token) session.User
+    | AuthResult(Error e) -> Auth { a with Busy = false; Error = Some e }, Cmd.none
+    | Failed ex -> Auth { a with Busy = false; Error = Some(Api.errorMessage ex) }, Cmd.none
+    | _ -> Auth a, Cmd.none
+
+let private updateApp msg (m: AppModel) : Model * Cmd<Msg> =
+    let stay (m, cmd) = App m, cmd
+
+    match msg with
+    | SignOut ->
+        Api.TokenStore.clear ()
+        Auth emptyAuth, Cmd.OfAsync.attempt m.Api.logout () (fun _ -> DismissNotice)
+    | Failed ex when Api.isUnauthorized ex ->
+        Api.TokenStore.clear ()
+        Auth { emptyAuth with Error = Some "Your session has ended. Please sign in again." }, Cmd.none
+    | Failed ex -> notice (Api.errorMessage ex) m |> stay
+    | DismissNotice -> App { m with Notice = None }, Cmd.none
+    | Navigate page -> navigate page m |> stay
+
+    | PostsLoaded(feed, posts) when m.Page = Feed feed ->
+        // Keep posts the user created while this feed was still loading.
+        let newest = posts |> List.tryHead |> Option.map (fun p -> p.Id) |> Option.defaultValue 0
+        let pending = m.Posts |> List.filter (fun p -> p.Id > newest)
+        App { m with Posts = pending @ posts; PostsLoading = false }, Cmd.none
+    | SetDraft text -> App { m with Draft = text }, Cmd.none
+    | SubmitPost when m.Draft.Trim() <> "" ->
+        let groupId =
+            match m.Page with
+            | Feed(GroupFeed g) -> Some g
+            | _ -> None
+
+        App m, call m.Api.createPost { GroupId = groupId; Body = m.Draft } PostCreated
+    | PostCreated(Ok post) -> App { m with Draft = ""; Posts = post :: m.Posts }, Cmd.none
+    | PostUpdated post -> App { m with Posts = replacePost post m.Posts }, Cmd.none
+    | ToggleLike postId -> App m, call m.Api.toggleLike postId PostUpdated
+    | DeletePost postId -> App m, call m.Api.deletePost postId (fun r -> PostDeleted(postId, r))
+    | PostDeleted(postId, Ok()) -> App { m with Posts = m.Posts |> List.filter (fun p -> p.Id <> postId) }, Cmd.none
+    | SetCommentDraft(postId, text) -> App { m with CommentDrafts = m.CommentDrafts.Add(postId, text) }, Cmd.none
+    | SubmitComment postId ->
+        match m.CommentDrafts.TryFind postId with
+        | Some text when text.Trim() <> "" ->
+            App m, Cmd.OfAsync.either (fun () -> m.Api.addComment postId text) () (fun r -> CommentAdded(postId, r)) Failed
+        | _ -> App m, Cmd.none
+    | CommentAdded(postId, Ok post) ->
+        App
+            { m with
+                Posts = replacePost post m.Posts
+                CommentDrafts = m.CommentDrafts.Remove postId },
+        Cmd.none
+
+    | GroupsLoaded groups -> App { m with Groups = groups }, Cmd.none
+    | SetNewGroupName name -> App { m with NewGroup = { m.NewGroup with Name = name } }, Cmd.none
+    | SetNewGroupDescription d -> App { m with NewGroup = { m.NewGroup with Description = d } }, Cmd.none
+    | SubmitGroup when m.NewGroup.Name.Trim() <> "" -> App m, call m.Api.createGroup m.NewGroup GroupCreated
+    | GroupCreated(Ok group) ->
+        App
+            { m with
+                Groups = replaceGroup group m.Groups
+                NewGroup = { Name = ""; Description = "" } },
+        Cmd.ofMsg (Navigate(Feed(GroupFeed group.Id)))
+    | SetMembership(groupId, isMember) ->
+        App m, Cmd.OfAsync.either (fun () -> m.Api.setMembership groupId isMember) () GroupUpdated Failed
+    | GroupUpdated group -> App { m with Groups = replaceGroup group m.Groups }, Cmd.none
+
+    | SetPeopleSearch term -> App { m with PeopleSearch = term }, call m.Api.getPeople term (fun people -> PeopleLoaded(term, people))
+    | PeopleLoaded(term, people) when term = m.PeopleSearch -> App { m with People = people }, Cmd.none
+    | EditProfile ->
+        App
+            { m with
+                ProfileDraft =
+                    Some
+                        { DisplayName = m.Me.DisplayName
+                          Title = m.Me.Title
+                          Department = m.Me.Department
+                          Bio = m.Me.Bio } },
+        Cmd.none
+    | SetProfileDraft draft -> App { m with ProfileDraft = Some draft }, Cmd.none
+    | CancelProfileEdit -> App { m with ProfileDraft = None }, Cmd.none
+    | SaveProfile ->
+        match m.ProfileDraft with
+        | Some draft -> App m, call m.Api.updateProfile draft ProfileSaved
+        | None -> App m, Cmd.none
+    | ProfileSaved(Ok me) -> App { m with Me = me; ProfileDraft = None; Page = Profile me }, Cmd.none
+
+    | ConversationsLoaded conversations -> App { m with Conversations = conversations }, Cmd.none
+    | MessagesLoaded(partnerId, incoming) ->
+        match m.Page with
+        | Chat(Some partner) when partner.Id = partnerId ->
+            let known = m.Messages |> List.map (fun x -> x.Id) |> Set.ofList
+            let fresh = incoming |> List.filter (fun x -> not (known.Contains x.Id))
+            App { m with Messages = m.Messages @ fresh |> List.sortBy (fun x -> x.Id) }, Cmd.none
+        | _ -> App m, Cmd.none
+    | PollChat ->
+        match m.Page with
+        | Chat(Some partner) ->
+            let lastId = m.Messages |> List.tryLast |> Option.map (fun x -> x.Id) |> Option.defaultValue 0
+            App m, Cmd.batch [ loadMessages m partner lastId; loadConversations m ]
+        | _ -> App m, Cmd.none
+    | SetMessageDraft text -> App { m with MessageDraft = text }, Cmd.none
+    | SendMessage ->
+        match m.Page with
+        | Chat(Some partner) when m.MessageDraft.Trim() <> "" ->
+            App { m with MessageDraft = "" },
+            Cmd.OfAsync.either (fun () -> m.Api.sendMessage partner.Id m.MessageDraft) () MessageSent Failed
+        | _ -> App m, Cmd.none
+    | MessageSent(Ok message) ->
+        App m, Cmd.batch [ Cmd.ofMsg (MessagesLoaded(message.RecipientId, [ message ])); loadConversations m ]
+
+    | PostCreated(Error e)
+    | PostDeleted(_, Error e)
+    | CommentAdded(_, Error e)
+    | GroupCreated(Error e)
+    | ProfileSaved(Error e)
+    | MessageSent(Error e) -> notice e m |> stay
+
+    | _ -> App m, Cmd.none
+
+let update (msg: Msg) (model: Model) : Model * Cmd<Msg> =
+    match model, msg with
+    | Starting, SessionRestored(api, me) -> startApp api me
+    | Starting, SessionInvalid ->
+        Api.TokenStore.clear ()
+        Auth emptyAuth, Cmd.none
+    | Auth a, _ -> updateAuth msg a
+    | App m, _ -> updateApp msg m
+    | Starting, _ -> model, Cmd.none
+
+/// While a chat thread is open, poll for new messages every few seconds.
+let subscribe (model: Model) : Sub<Msg> =
+    match model with
+    | App { Page = Chat(Some partner) } ->
+        [ [ "chat"; string partner.Id ],
+          fun dispatch ->
+              let id = Browser.Dom.window.setInterval ((fun () -> dispatch PollChat), 3000)
+
+              { new IDisposable with
+                  member _.Dispose() = Browser.Dom.window.clearInterval id } ]
+    | _ -> []

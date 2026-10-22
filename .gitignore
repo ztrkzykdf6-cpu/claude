@@ -1,0 +1,11 @@
+bin/
+obj/
+node_modules/
+src/Client/output/
+src/Server/wwwroot/
+*.db
+*.db-shm
+*.db-wal
+.vs/
+.idea/
+*.user

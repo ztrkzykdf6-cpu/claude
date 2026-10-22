@@ -1,0 +1,9 @@
+<Project>
+  <PropertyGroup>
+    <!-- Fable.Remoting.Server needs a newer FSharp.Core than the SDK bundles. -->
+    <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" Version="10.1.202" />
+  </ItemGroup>
+</Project>
